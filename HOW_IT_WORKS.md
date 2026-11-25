@@ -1,8 +1,8 @@
 # How rc_os Works
 
-rc_os is a small x86_64 kernel written in Rust. It follows Philipp Oppermann's [Writing an OS in Rust](https://os.phil-opp.com/) series. That series explains how to **build** each piece. This document explains how the pieces **work** once they are built: what the hardware does, what each file is responsible for, and how control moves from power-on to a blinking `.` on the screen.
+rc_os is a small x86_64 kernel written in Rust. It follows Philipp Oppermann's [Writing an OS in Rust](https://os.phil-opp.com/) series. That series explains how to **build** each piece. This document explains how the pieces **work** once they are built: what the hardware does, what each file is responsible for, and how control moves from power-on to text appearing as you type.
 
-Current stage: **Hardware Interrupts** (through "The hlt Instruction"). The kernel boots, prints text, handles CPU exceptions, survives stack overflows, receives timer interrupts without deadlocking, and sleeps the CPU when idle.
+Current stage: **Hardware Interrupts** (complete, through "Keyboard Input"). The kernel boots, prints text, handles CPU exceptions, survives stack overflows, receives timer interrupts without deadlocking, sleeps the CPU when idle, and echoes what you type.
 
 ---
 
@@ -20,8 +20,9 @@ Current stage: **Hardware Interrupts** (through "The hlt Instruction"). The kern
 10. [Shared state: why everything is a `Mutex` in a `lazy_static`](#10-shared-state-why-everything-is-a-mutex-in-a-lazy_static)
 11. [Deadlocks: locks vs. interrupts](#11-deadlocks-locks-vs-interrupts)
 12. [Idling with `hlt`](#12-idling-with-hlt)
-13. [File map](#13-file-map)
-14. [Running it](#14-running-it)
+13. [Keyboard input](#13-keyboard-input)
+14. [File map](#14-file-map)
+15. [Running it](#15-running-it)
 
 ---
 
@@ -41,6 +42,7 @@ Current stage: **Hardware Interrupts** (through "The hlt Instruction"). The kern
  │                                                            │
  │  CPU exception ──► IDT ──► breakpoint / double fault       │
  │  Timer chip ─► PIC ─► IDT[32] ──► timer_interrupt_handler  │
+ │  Keyboard ─► PIC ─► IDT[33] ──► keyboard_interrupt_handler │
  │                                                            │
  │  println! ─► VGA buffer @ 0xb8000 ─► QEMU window           │
  │  serial_println! ─► UART @ port 0x3F8 ─► your terminal     │
@@ -413,7 +415,7 @@ pub enum InterruptionIndex {
 }
 ```
 
-This gives vector numbers readable names. More entries (such as `Keyboard`, which will be `PIC_1_OFFSET + 1`) are added as more devices are handled.
+This gives vector numbers readable names. More entries are added as more devices are handled. `Keyboard` (`PIC_1_OFFSET + 1`) is covered in section 13.
 
 ### Turning interrupts on
 
@@ -586,7 +588,111 @@ Two things to know:
 
 ---
 
-## 13. File map
+## 13. Keyboard input
+
+**Files:** `src/interrupts.rs`. This matches the "Keyboard Input" part of the [Hardware Interrupts](https://os.phil-opp.com/hardware-interrupts/) post.
+
+### From key press to interrupt
+
+The keyboard does not talk to the CPU directly. It sends bytes to the **PS/2 controller**, a chip on the motherboard. Even USB keyboards are usually emulated as PS/2 by the firmware, and QEMU emulates a PS/2 keyboard. When the controller has a byte ready, it raises **IRQ 1** on the primary PIC.
+
+```
+ key pressed ─► keyboard ─► PS/2 controller ─► PIC IRQ1 ─► vector 33 ─► keyboard_interrupt_handler
+                                   │
+                         byte waits in I/O port 0x60
+```
+
+Because the primary PIC was remapped to start at 32, IRQ 1 arrives as vector **33**. The enum gets this for free: `#[repr(u8)]` enum values count up from the previous one, so `Keyboard` comes right after `Timer = 32`.
+
+```rust
+pub enum InterruptionIndex {
+    Timer = PIC_1_OFFSET,   // 32, IRQ0
+    Keyboard,               // 33, IRQ1
+}
+```
+
+The handler is registered in the IDT alongside the timer:
+
+```rust
+idt[InterruptionIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+```
+
+### Scancodes
+
+The keyboard doesn't send characters. It sends **scancodes**: numbers that identify a *physical key* and whether it went **down** or **up**. Turning that into the character `A` is the kernel's job, and depends on layout, Shift, Caps Lock, and so on.
+
+The handler reads one scancode byte from the controller's data port:
+
+```rust
+let mut port = Port::new(0x60);
+let scancode: u8 = unsafe { port.read() };
+```
+
+**Reading the port is required, not optional.** The controller won't send the next byte, or raise another interrupt, until the current one has been read. A handler that only sends EOI without reading port `0x60` sees exactly one key press and then silence. That's the same symptom as forgetting EOI, but for a different reason.
+
+There are three scancode *sets*. By default the PS/2 controller translates everything to **set 1**, the original IBM XT format, which is why the code uses `ScancodeSet1`. In set 1:
+
+| Event | Bytes | Example: the `A` key |
+|---|---|---|
+| Key down ("make" code) | one byte below `0x80` | `0x1E` |
+| Key up ("break" code) | the make code with the top bit set (`make \| 0x80`) | `0x9E` |
+| Extended keys (arrows, right Ctrl...) | prefixed with `0xE0` | right arrow: `0xE0 0x4D` |
+
+Each byte arrives as a **separate interrupt**. A single press of right arrow causes two interrupts, and releasing it causes two more. Decoding therefore needs memory that lasts *between* interrupts, which is what the `pc-keyboard` crate provides.
+
+### Decoding with `pc-keyboard`
+
+```rust
+static KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
+    Mutex::new(Keyboard::new(
+        ScancodeSet1::new(),     // how to read the bytes
+        layouts::Us104Key,       // how keys map to characters (US layout)
+        HandleControl::Ignore,   // Ctrl+A gives 'a', not the control character U+0001
+    ));
+```
+
+Decoding happens in two stages:
+
+```
+ scancode byte ──add_byte()──► Option<KeyEvent> ──process_keyevent()──► Option<DecodedKey>
+                (set 1 parser:                    (layout + modifier state:
+                 handles 0xE0 prefixes,            tracks Shift/Ctrl/Alt/Caps,
+                 make vs. break)                   picks the character)
+```
+
+1. **`add_byte`** feeds one byte into the scancode parser. It returns `Ok(None)` when it needs more bytes (after an `0xE0` prefix) and `Ok(Some(KeyEvent))` once it has a complete event such as "key `A`, went down".
+2. **`process_keyevent`** updates the modifier state. For example, Shift down sets a flag, and Shift up clears it. It then applies the layout and returns:
+   - `DecodedKey::Unicode(char)` for keys that produce text: `a`, `A` (with Shift), `!`, space, `\n` for Enter.
+   - `DecodedKey::RawKey(KeyCode)` for keys that don't: `F1`, arrows, and the modifier keys themselves.
+   - `None` for events that produce nothing, such as most key *releases*.
+
+The handler prints Unicode keys as characters and raw keys with `{:?}`. That's why pressing Shift+R shows `LShiftR` on screen: `RawKey(LShift)` is printed as `LShift` when Shift goes down, then `Unicode('R')` is printed when R is pressed.
+
+### Why `KEYBOARD` is a `static` inside the handler
+
+The decoder's state (modifiers held, half-received `0xE0` sequences) must survive from one interrupt to the next, so it can't be a local variable. Declaring the `static` *inside* the handler function keeps it private: no other code can even name it.
+
+The post wraps this in `lazy_static!`. This project uses a plain `static` instead, which works because `Keyboard::new`, `ScancodeSet1::new` and `spin::Mutex::new` are all `const fn` in the versions used. The value is built at compile time, with no first-use check at runtime.
+
+It still needs a `Mutex` because Rust doesn't allow mutating a `static` without one (section 10). The lock can never deadlock: only this handler takes it, and the handler runs with interrupts disabled, so it can't interrupt itself.
+
+### Printing from the handler
+
+`print!` here goes through the interrupt-safe `_print` from section 11. Interrupts are already off inside a handler, so `without_interrupts` leaves them off. If the main code happens to be printing when a key is pressed, the keyboard interrupt is simply delivered once that print finishes.
+
+### End of Interrupt
+
+As with the timer, the handler finishes by sending EOI for the keyboard vector. Otherwise the PIC would block every further IRQ 1, and all lower-priority IRQs as well:
+
+```rust
+unsafe {
+    PICS.lock().notify_end_of_interrupt(InterruptionIndex::Keyboard.as_u8());
+}
+```
+
+---
+
+## 14. File map
 
 | File | Role |
 |---|---|
@@ -594,7 +700,7 @@ Two things to know:
 | `src/lib.rs` | `init()`, `hlt_loop()`, the test framework (`test_runner`, `Testable`), QEMU exit, test panic handler. |
 | `src/vga_buffer.rs` | VGA text-mode writer, `print!` and `println!` (interrupt-safe). |
 | `src/serial.rs` | UART serial output, `serial_print!` and `serial_println!` (interrupt-safe). |
-| `src/interrupts.rs` | IDT, exception handlers, PIC setup, timer handler. |
+| `src/interrupts.rs` | IDT, exception handlers, PIC setup, timer and keyboard handlers. |
 | `src/gdt.rs` | GDT, TSS, double-fault IST stack. |
 | `tests/basic_boot.rs` | Integration test: printing works at boot. |
 | `tests/should_panic.rs` | Integration test: panics are reported. |
@@ -610,6 +716,7 @@ Two things to know:
 | `bootloader` 0.9 | Bootloader that `bootimage` links with the kernel. |
 | `x86_64` | Safe wrappers for IDT, GDT, TSS, port I/O, and CPU instructions (`int3`, `sti`, `lidt`...). |
 | `pic8259` | `ChainedPics`: initializing and sending EOIs to the two 8259 PICs. |
+| `pc-keyboard` | Decodes PS/2 scancodes (set 1, US layout) into key events and characters. |
 | `uart_16550` | Serial port driver. |
 | `spin` | Spinlock `Mutex` for `no_std`. |
 | `lazy_static` | Statics that are initialized at runtime. |
@@ -617,12 +724,12 @@ Two things to know:
 
 ---
 
-## 14. Running it
+## 15. Running it
 
 Requirements: a nightly Rust toolchain with `rust-src`, `llvm-tools-preview`, `bootimage` (`cargo install bootimage`), and QEMU.
 
 ```sh
-cargo run          # build the disk image and boot it in QEMU
+cargo run          # build the disk image and boot it in QEMU; click the window and type
 cargo test         # run unit + integration tests headless; results print to your terminal
 cargo test --test stack_overflow   # run a single integration test
 ```
