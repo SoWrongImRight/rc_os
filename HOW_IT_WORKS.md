@@ -2,7 +2,7 @@
 
 rc_os is a small x86_64 kernel written in Rust. It follows Philipp Oppermann's [Writing an OS in Rust](https://os.phil-opp.com/) series. That series explains how to **build** each piece. This document explains how the pieces **work** once they are built: what the hardware does, what each file is responsible for, and how control moves from power-on to a blinking `.` on the screen.
 
-Current stage: **Hardware Interrupts**. The kernel boots, prints text, handles CPU exceptions, survives stack overflows, and receives timer interrupts.
+Current stage: **Hardware Interrupts** (through "The hlt Instruction"). The kernel boots, prints text, handles CPU exceptions, survives stack overflows, receives timer interrupts without deadlocking, and sleeps the CPU when idle.
 
 ---
 
@@ -18,9 +18,10 @@ Current stage: **Hardware Interrupts**. The kernel boots, prints text, handles C
 8. [Double faults, the GDT, and the TSS](#8-double-faults-the-gdt-and-the-tss)
 9. [Hardware interrupts: the PIC and the timer](#9-hardware-interrupts-the-pic-and-the-timer)
 10. [Shared state: why everything is a `Mutex` in a `lazy_static`](#10-shared-state-why-everything-is-a-mutex-in-a-lazy_static)
-11. [Known issue: the print deadlock](#11-known-issue-the-print-deadlock)
-12. [File map](#12-file-map)
-13. [Running it](#13-running-it)
+11. [Deadlocks: locks vs. interrupts](#11-deadlocks-locks-vs-interrupts)
+12. [Idling with `hlt`](#12-idling-with-hlt)
+13. [File map](#13-file-map)
+14. [Running it](#14-running-it)
 
 ---
 
@@ -124,10 +125,10 @@ This is also why `cargo` warns that `bootloader` is an "unused dependency": our 
    rc_os::init();          // GDT, IDT, PIC, enable interrupts
    #[cfg(test)] test_main();
    println!("It did not crash!");
-   loop {}                 // the kernel never exits
+   rc_os::hlt_loop();      // the kernel never exits; sleep until each interrupt
    ```
 
-`loop {}` busy-spins the CPU at 100%. A later post replaces it with the `hlt` instruction, which sleeps until the next interrupt.
+From here on, the kernel does no work of its own. Everything that happens next is driven by interrupts (see sections 9 and 12).
 
 ---
 
@@ -174,7 +175,7 @@ lazy_static! {
 }
 ```
 
-`print!` and `println!` are macros that call `vga_buffer::_print`, which locks `WRITER` and writes the formatted text. Section 10 explains why this is a `Mutex` inside a `lazy_static`.
+`print!` and `println!` are macros that call `vga_buffer::_print`, which locks `WRITER` and writes the formatted text. Section 10 explains why this is a `Mutex` inside a `lazy_static`, and section 11 explains why the lock is taken with interrupts disabled.
 
 ---
 
@@ -360,6 +361,8 @@ stack overflow ─► page fault ─► can't push frame ─► DOUBLE FAULT
 
 `init()` calls `gdt::init()` **before** `init_idt()`. The IDT's double-fault entry refers to IST index 0, which only means something once the TSS is loaded.
 
+`stack_overflow.rs` deliberately calls only `gdt::init()` and loads its own IDT, not `rc_os::init()`. So in that test interrupts are never enabled, and a timer tick can't interfere with the overflow being tested.
+
 ---
 
 ## 9. Hardware interrupts: the PIC and the timer
@@ -464,11 +467,13 @@ Rust `static`s must be computed at compile time. Building an IDT, calling `Uart1
 
 ---
 
-## 11. Known issue: the print deadlock
+## 11. Deadlocks: locks vs. interrupts
 
-> This is the exact problem covered in the **"Deadlocks"** section of the Hardware Interrupts post, and the fix is the next step there.
+**Files:** `src/vga_buffer.rs`, `src/serial.rs`
 
-With interrupts enabled, the following can happen:
+### The problem
+
+Once interrupts are enabled, a handler can run *in the middle of* any other code, including code that is holding a lock:
 
 ```
  main code                         timer interrupt
@@ -482,30 +487,113 @@ With interrupts enabled, the following can happen:
                                      spin... spin... forever
 ```
 
-The interrupt handler waits for a lock that the interrupted code holds. That code can't continue until the handler returns. Neither side can move: a **deadlock**.
+The handler waits for a lock that the interrupted code holds, and the interrupted code can't continue until the handler returns. Neither side can make progress: a **deadlock**.
 
-You can reproduce it today. `cargo test` hangs in `test_println_many`, which prints 200 lines so a timer tick is almost certain to land mid-print, and then `bootimage` times out.
+This is different from a deadlock between two threads. There is only **one** CPU and **one** flow of control here. The interrupt handler is *borrowing* the CPU from the code it interrupted, so the lock holder literally cannot run until the handler finishes. A spinlock can never be released in this situation.
 
-**The fix** (next part of the post): disable interrupts while holding the lock, in both `vga_buffer::_print` and `serial::_print`:
+Before the fix, `cargo test` reliably hung in `test_println_many`. Printing 200 lines takes long enough that a timer tick is almost certain to land while `WRITER` is locked.
+
+### The fix: no interrupts while holding the lock
+
+Both `_print` functions now take the lock inside `without_interrupts`:
 
 ```rust
-x86_64::instructions::interrupts::without_interrupts(|| {
-    WRITER.lock().write_fmt(args).unwrap();
+pub fn _print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    use x86_64::instructions::interrupts;
+
+    interrupts::without_interrupts(|| {
+        WRITER.lock().write_fmt(args).unwrap();
+    });
+}
+```
+
+`without_interrupts` does three things:
+
+1. Saves whether interrupts were enabled, then runs `cli` (clear interrupt flag).
+2. Runs the closure. The lock is taken *and released* inside it.
+3. Re-enables interrupts (`sti`) only if they were enabled before.
+
+Step 3 matters. Interrupt handlers run with interrupts already disabled, so when the timer handler calls `print!`, `without_interrupts` must **not** turn them back on at the end. Restoring the previous state, rather than always enabling, makes the function safe to call from anywhere.
+
+While interrupts are disabled, a timer tick isn't lost. The PIC holds it as *pending* and delivers it the moment `sti` runs. So the `.` just arrives a few microseconds later.
+
+`serial.rs` gets the same treatment. Nothing prints to serial from an interrupt handler yet, but the first time one does, it would deadlock in exactly the same way. Fixing both now means it can't happen later.
+
+**Rule of thumb:** any lock that an interrupt handler might take must only be held with interrupts disabled. Keep those sections short, because interrupts that wait too long add latency to every device.
+
+### A related race in `test_println_output`
+
+This test prints a line and then reads it back from the screen buffer, expecting it on the second-to-last row (`BUFFER_HEIGHT - 2`). The `_print` fix stops the deadlock, but leaves a gap *between* the print and the check:
+
+```
+println!(s)          ← lock taken and released
+      ◄── tick: "." is printed on the bottom row,
+          or wraps a line, and shifts everything up
+read row BUFFER_HEIGHT - 2   ← no longer holds `s`  ✖
+```
+
+The fix is to make print-and-check one uninterruptible step, holding a single lock for the whole test:
+
+```rust
+interrupts::without_interrupts(|| {
+    let mut writer = WRITER.lock();
+    writeln!(writer, "\n{}", s).expect("writeln failed");
+    for (i, c) in s.chars().enumerate() {
+        let screen_char = writer.buffer.chars[BUFFER_HEIGHT - 2][i].read();
+        assert_eq!(char::from(screen_char.ascii_character), c);
+    }
 });
 ```
 
-A related race affects `test_println_output`. A timer `.` can land between the `println!` and the check of the screen contents, which moves the text. The post fixes this by holding the lock and disabling interrupts for the whole test.
+Two details:
+
+- It writes through the `writer` guard with `writeln!` (which is why `core::fmt::Write` is imported), not with `println!`. `println!` would try to take `WRITER` again.
+- The leading `\n` starts a fresh line, in case an earlier `.` left the cursor partway along the bottom row.
+
+> **Spinlocks are not re-entrant.** Inside this closure, calling `WRITER.lock()` a second time, or calling `println!`, would deadlock on the guard that `writer` already holds. It would hang the same way as the interrupt case, just without any interrupt involved. Always read through the guard you already have.
 
 ---
 
-## 12. File map
+## 12. Idling with `hlt`
+
+**Files:** `src/lib.rs`, `src/main.rs`
+
+Before this step, the kernel ended with `loop {}`: an empty loop that keeps the CPU busy at 100% doing nothing. You can see this on the host, where QEMU uses a full core even while the kernel is idle.
+
+`hlt` is the x86 instruction for "stop executing until the next interrupt arrives". The CPU drops into a low-power state, wakes up to run the interrupt handler, and then continues with the instruction after `hlt`. Wrapping it in a loop gives an idle loop that sleeps between interrupts:
+
+```rust
+pub fn hlt_loop() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+```
+
+Each timer tick now wakes the CPU, the handler prints a `.`, `iretq` returns to just after `hlt`, the loop goes round, and the CPU sleeps again. Host CPU usage drops to almost nothing.
+
+`hlt_loop` returns `!`, so it can be the last thing in any function that must never return. It replaces `loop {}` in:
+
+- `_start` in `main.rs` (after boot),
+- the normal panic handler in `main.rs`,
+- the test `_start` and `test_panic_handler` in `lib.rs`.
+
+Two things to know:
+
+- **`hlt` only wakes on an interrupt.** If interrupts are disabled, for example after a panic inside an interrupt handler, `hlt_loop` sleeps forever. That's fine for a panic, since we want to stop anyway. If a panic happens in normal code, interrupts are still on, so timer dots keep appearing after the panic message.
+- **The integration tests in `tests/` still use `loop {}`.** Those spots are only reached after `exit_qemu`, which ends QEMU straight away, so the loop body never actually runs.
+
+---
+
+## 13. File map
 
 | File | Role |
 |---|---|
 | `src/main.rs` | Kernel entry point (`_start`), normal panic handler. |
-| `src/lib.rs` | `init()`, the test framework (`test_runner`, `Testable`), QEMU exit, test panic handler. |
-| `src/vga_buffer.rs` | VGA text-mode writer, `print!` and `println!`. |
-| `src/serial.rs` | UART serial output, `serial_print!` and `serial_println!`. |
+| `src/lib.rs` | `init()`, `hlt_loop()`, the test framework (`test_runner`, `Testable`), QEMU exit, test panic handler. |
+| `src/vga_buffer.rs` | VGA text-mode writer, `print!` and `println!` (interrupt-safe). |
+| `src/serial.rs` | UART serial output, `serial_print!` and `serial_println!` (interrupt-safe). |
 | `src/interrupts.rs` | IDT, exception handlers, PIC setup, timer handler. |
 | `src/gdt.rs` | GDT, TSS, double-fault IST stack. |
 | `tests/basic_boot.rs` | Integration test: printing works at boot. |
@@ -529,7 +617,7 @@ A related race affects `test_println_output`. A timer `.` can land between the `
 
 ---
 
-## 13. Running it
+## 14. Running it
 
 Requirements: a nightly Rust toolchain with `rust-src`, `llvm-tools-preview`, `bootimage` (`cargo install bootimage`), and QEMU.
 
