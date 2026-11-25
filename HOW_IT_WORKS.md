@@ -2,7 +2,7 @@
 
 rc_os is a small x86_64 kernel written in Rust. It follows Philipp Oppermann's [Writing an OS in Rust](https://os.phil-opp.com/) series. That series explains how to **build** each piece. This document explains how the pieces **work** once they are built: what the hardware does, what each file is responsible for, and how control moves from power-on to text appearing as you type.
 
-Current stage: **Hardware Interrupts** (complete, through "Keyboard Input"). The kernel boots, prints text, handles CPU exceptions, survives stack overflows, receives timer interrupts without deadlocking, sleeps the CPU when idle, and echoes what you type.
+Current stage: **Paging Implementation** (through "Creating a New Mapping"). The kernel boots, prints text, handles CPU exceptions and page faults, survives stack overflows, handles timer and keyboard interrupts, can read and modify its own page tables, and maps a virtual page to the VGA buffer.
 
 ---
 
@@ -10,7 +10,7 @@ Current stage: **Hardware Interrupts** (complete, through "Keyboard Input"). The
 
 1. [The big picture](#1-the-big-picture)
 2. [Building a kernel with no OS underneath](#2-building-a-kernel-with-no-os-underneath)
-3. [Boot: from power-on to `_start`](#3-boot-from-power-on-to-_start)
+3. [Boot: from power-on to `kernel_main`](#3-boot-from-power-on-to-kernel_main)
 4. [Printing to the screen: the VGA text buffer](#4-printing-to-the-screen-the-vga-text-buffer)
 5. [Printing to the host: the serial port](#5-printing-to-the-host-the-serial-port)
 6. [Testing inside QEMU](#6-testing-inside-qemu)
@@ -21,8 +21,11 @@ Current stage: **Hardware Interrupts** (complete, through "Keyboard Input"). The
 11. [Deadlocks: locks vs. interrupts](#11-deadlocks-locks-vs-interrupts)
 12. [Idling with `hlt`](#12-idling-with-hlt)
 13. [Keyboard input](#13-keyboard-input)
-14. [File map](#14-file-map)
-15. [Running it](#15-running-it)
+14. [Paging: virtual memory](#14-paging-virtual-memory)
+15. [Reaching the page tables: `BootInfo` and the physical memory offset](#15-reaching-the-page-tables-bootinfo-and-the-physical-memory-offset)
+16. [Creating a mapping](#16-creating-a-mapping)
+17. [File map](#17-file-map)
+18. [Running it](#18-running-it)
 
 ---
 
@@ -31,7 +34,7 @@ Current stage: **Hardware Interrupts** (complete, through "Keyboard Input"). The
 ```
  ┌──────────────── QEMU (emulated x86_64 PC) ─────────────────┐
  │                                                            │
- │  BIOS ─► bootloader crate ─► _start()  (src/main.rs)       │
+ │  BIOS ─► bootloader ─► kernel_main(boot_info) (main.rs)    │
  │                                  │                         │
  │                                  ▼                         │
  │                           rc_os::init()  (src/lib.rs)      │
@@ -40,7 +43,7 @@ Current stage: **Hardware Interrupts** (complete, through "Keyboard Input"). The
  │             gdt::init   init_idt()   PICS.initialize  sti  │
  │             (GDT+TSS)   (handlers)   (remap IRQs)  (enable)│
  │                                                            │
- │  CPU exception ──► IDT ──► breakpoint / double fault       │
+ │  CPU exception ──► IDT ──► breakpoint/page/double fault    │
  │  Timer chip ─► PIC ─► IDT[32] ──► timer_interrupt_handler  │
  │  Keyboard ─► PIC ─► IDT[33] ──► keyboard_interrupt_handler │
  │                                                            │
@@ -71,6 +74,8 @@ A normal Rust program assumes an operating system is present to provide threads,
   ```
 
   It returns `!` (never) because there is nothing to return to.
+
+  The kernel binary no longer writes `_start` by hand. The `bootloader` crate's `entry_point!` macro generates it and calls a normal Rust function, `kernel_main`, with a type-checked signature. See section 15. The integration tests in `tests/` still write `_start` directly, as shown above.
 
 ### Panics
 
@@ -112,19 +117,22 @@ The compiled kernel is an ELF file. A PC cannot boot an ELF file directly. The `
 2. links our kernel ELF into it, and
 3. produces a raw disk image (`bootimage-rc_os.bin`) that QEMU can boot.
 
-This is also why `cargo` warns that `bootloader` is an "unused dependency": our code never calls it, but `bootimage` needs it in `Cargo.toml`.
+The kernel also uses the `bootloader` crate directly. Its `entry_point!` macro and `BootInfo` type are covered in section 15.
 
 ---
 
-## 3. Boot: from power-on to `_start`
+## 3. Boot: from power-on to `kernel_main`
 
 1. **BIOS** runs from firmware, finds the bootable disk, and loads its first 512 bytes.
-2. **The bootloader** (from the `bootloader` crate) takes over. The CPU starts in 16-bit *real mode*, and the bootloader moves it through 32-bit *protected mode* into 64-bit *long mode*. It sets up an initial page table, loads our kernel from the disk image, sets up a stack, and jumps to `_start`.
-3. **`_start`** (`src/main.rs`):
+2. **The bootloader** (from the `bootloader` crate) takes over. The CPU starts in 16-bit *real mode*, and the bootloader moves it through 32-bit *protected mode* into 64-bit *long mode*. It sets up page tables (including a mapping of all physical memory, see section 15), loads our kernel from the disk image, sets up a stack, and jumps to `_start` with a pointer to a `BootInfo` struct.
+3. **`_start`** is generated by `entry_point!` and immediately calls **`kernel_main(boot_info)`** (`src/main.rs`):
 
    ```rust
    println!("Hello World{}", "!");
    rc_os::init();          // GDT, IDT, PIC, enable interrupts
+   // paging demo: get the page tables, map page 0 to the VGA buffer, write "New!"
+   let mut mapper = unsafe { memory::init(phys_mem_offset) };
+   memory::create_example_mapping(page, &mut mapper, &mut frame_allocator);
    #[cfg(test)] test_main();
    println!("It did not crash!");
    rc_os::hlt_loop();      // the kernel never exits; sleep until each interrupt
@@ -210,7 +218,7 @@ Rust's built-in test framework depends on `std`, so this project uses the unstab
 
 1. The compiler collects every function marked `#[test_case]`.
 2. It generates a function, which we rename to `test_main`, that passes them all as a slice to our `test_runner`.
-3. When built with `cfg(test)`, `_start` calls `test_main()`.
+3. When built with `cfg(test)`, the entry point calls `test_main()`. In `lib.rs` that entry point is `test_kernel_main`, set up with `entry_point!`.
 4. `test_runner` calls each test through the `Testable` trait, which prints `name...\t[ok]` over serial.
 5. When all tests pass, it calls `exit_qemu(Success)`.
 
@@ -274,6 +282,9 @@ lazy_static! {
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         idt[InterruptionIndex::Timer.as_u8()]                           // vector 32
             .set_handler_fn(timer_interrupt_handler);
+        idt[InterruptionIndex::Keyboard.as_u8()]                        // vector 33
+            .set_handler_fn(keyboard_interrupt_handler);
+        idt.page_fault.set_handler_fn(page_fault_handler);              // vector 14
         idt
     };
 }
@@ -283,6 +294,8 @@ lazy_static! {
 
 - **Breakpoint (3):** prints the stack frame and **returns**, so execution continues after the `int3`. The `test_breakpoint_exception` test checks exactly this: if the handler were broken, the test kernel would crash.
 - **Double fault (8):** returns `!` and panics. See the next section.
+- **Page fault (14):** prints the faulting address and error code, then halts. See section 14.
+- **Timer (32) and keyboard (33):** hardware interrupts. See sections 9 and 13.
 
 ---
 
@@ -577,9 +590,10 @@ Each timer tick now wakes the CPU, the handler prints a `.`, `iretq` returns to 
 
 `hlt_loop` returns `!`, so it can be the last thing in any function that must never return. It replaces `loop {}` in:
 
-- `_start` in `main.rs` (after boot),
+- `kernel_main` in `main.rs` (after boot),
 - the normal panic handler in `main.rs`,
-- the test `_start` and `test_panic_handler` in `lib.rs`.
+- the test entry point (`test_kernel_main`) and `test_panic_handler` in `lib.rs`,
+- the page fault handler (section 14).
 
 Two things to know:
 
@@ -692,15 +706,247 @@ unsafe {
 
 ---
 
-## 14. File map
+## 14. Paging: virtual memory
+
+**Files:** `src/interrupts.rs` (page fault handler). This matches the [Introduction to Paging](https://os.phil-opp.com/paging-introduction/) post.
+
+### Virtual vs. physical addresses
+
+Every address the kernel uses, such as a pointer, the stack pointer, or the instruction pointer, is a **virtual address**. The CPU's **memory management unit (MMU)** translates each one to a **physical address**, an actual location in RAM or a device, on every single memory access.
+
+Memory is managed in fixed-size blocks:
+
+- a **page** is a 4 KiB block of *virtual* address space,
+- a **frame** is a 4 KiB block of *physical* memory,
+- a **page table** says which frame, if any, each page maps to.
+
+This is what lets every program have its own address space, lets the kernel protect memory (read-only, no-execute, kernel-only), and lets an unmapped **guard page** catch stack overflows (section 8).
+
+### Four-level page tables
+
+On x86_64, a virtual address is split into five parts. Only the low 48 bits are used. Bits 48–63 must be copies of bit 47 (a *canonical* address), or the CPU faults.
+
+```
+ 63      48 47     39 38     30 29     21 20     12 11          0
+┌──────────┬─────────┬─────────┬─────────┬─────────┬─────────────┐
+│ sign ext │ L4 idx  │ L3 idx  │ L2 idx  │ L1 idx  │   offset    │
+│ (unused) │ 9 bits  │ 9 bits  │ 9 bits  │ 9 bits  │   12 bits   │
+└──────────┴─────────┴─────────┴─────────┴─────────┴─────────────┘
+```
+
+Each page table is exactly one 4 KiB frame holding 512 entries of 8 bytes, so 9 bits pick an entry. The 12-bit offset picks a byte within the 4 KiB page. To translate, the MMU walks the tables:
+
+```
+ CR3 ──► Level 4 table ──[L4 idx]──► Level 3 table ──[L3 idx]──► Level 2 table
+                                                                      │
+                                                                  [L2 idx]
+                                                                      ▼
+ physical address ◄── + offset ◄── frame ◄──[L1 idx]── Level 1 table
+```
+
+- The **`CR3` register** holds the *physical* address of the level 4 table.
+- Each entry holds the *physical* address of the next table (or, at level 1, of the final frame) plus **flags**: `PRESENT`, `WRITABLE`, `USER_ACCESSIBLE`, `NO_EXECUTE`, `HUGE_PAGE`, and so on.
+- If an entry at level 3 or 2 has `HUGE_PAGE` set, it points straight at a 1 GiB or 2 MiB frame and the walk stops early.
+
+Walking four tables on every access would be slow, so the CPU caches recent translations in the **TLB** (translation lookaside buffer). The TLB is *not* updated automatically when a page table changes. After changing a mapping, the kernel must flush that page's TLB entry with the `invlpg` instruction, or the CPU may keep using the old translation.
+
+### Page faults
+
+If the walk finds a missing entry, or the access isn't allowed (a write to a read-only page, for example), the CPU raises a **page fault** (exception 14). Before calling the handler it:
+
+- stores the address that was accessed in the **`CR2` register**, and
+- pushes an **error code** describing what went wrong.
+
+```rust
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    use x86_64::registers::control::Cr2;
+
+    println!("EXCEPTION: PAGE FAULT");
+    println!("Accessed Address: {:?}", Cr2::read());
+    println!("Error code: {:?}", error_code);
+    println!("{:#?}", stack_frame);
+    hlt_loop();
+}
+```
+
+`PageFaultErrorCode` decodes the error code bits:
+
+| Flag | Meaning when set |
+|---|---|
+| `PROTECTION_VIOLATION` | The page *was* present, but the access wasn't allowed. If clear, the page wasn't mapped at all. |
+| `CAUSED_BY_WRITE` | The access was a write (otherwise a read). |
+| `USER_MODE` | The access came from user mode (ring 3). |
+| `MALFORMED_TABLE` | A reserved bit was set in a page table entry. |
+| `INSTRUCTION_FETCH` | The CPU was fetching an instruction (no-execute violation). |
+
+The handler can't fix anything yet, so it reports and stops in `hlt_loop()`. It can't simply return: the CPU would retry the same instruction and fault again, forever. Unlike the timer and keyboard handlers, no EOI is sent, because a page fault is a CPU exception, not a PIC interrupt.
+
+Before this handler existed, a page fault had no IDT entry, which escalated into a double fault. Now the actual cause and address are printed.
+
+---
+
+## 15. Reaching the page tables: `BootInfo` and the physical memory offset
+
+**Files:** `Cargo.toml`, `src/main.rs`, `src/lib.rs`, `src/memory.rs`. This matches the [Paging Implementation](https://os.phil-opp.com/paging-implementation/) post.
+
+### The chicken-and-egg problem
+
+Page table entries contain **physical** addresses, but the kernel can only use **virtual** addresses. Reading `CR3` gives the physical address of the level 4 table, and dereferencing that number as a pointer would go through the MMU and land somewhere else entirely.
+
+The kernel needs *some* virtual address that maps to each page table frame. This project uses the simplest approach: **map all of physical memory** into the virtual address space at a fixed offset.
+
+```
+ virtual address space                          physical memory
+┌────────────────────────────┐
+│ kernel, stack, VGA, ...    │
+├────────────────────────────┤ ◄─ physical_memory_offset
+│ physical frame 0           │ ──────────────► frame 0
+│ physical frame 1           │ ──────────────► frame 1
+│ ...                        │                  ...
+│ physical frame N           │ ──────────────► frame N
+└────────────────────────────┘
+```
+
+Then **virtual = physical + offset** for every frame, including every page table.
+
+Turning on the bootloader's `map_physical_memory` feature makes it set up this mapping before jumping to the kernel:
+
+```toml
+bootloader = { version = "0.9", features = ["map_physical_memory"] }
+```
+
+The bootloader chooses the offset, so the kernel has to be told what it is.
+
+### `entry_point!` and `BootInfo`
+
+The bootloader passes a pointer to a **`BootInfo`** struct as the first argument to the entry point. It contains `physical_memory_offset` and also a `memory_map` of which physical regions are usable RAM, which the next step of the post uses.
+
+We could just add a `&'static BootInfo` parameter to `_start`, but nothing would check that the signature matches what the bootloader really passes. The `entry_point!` macro solves this:
+
+```rust
+entry_point!(kernel_main);
+
+fn kernel_main(boot_info: &'static BootInfo) -> ! { ... }
+```
+
+It generates the real `#[no_mangle] extern "C" fn _start(boot_info: &'static BootInfo)` for us, and it **type-checks** that `kernel_main` has exactly the right signature. `kernel_main` is now an ordinary Rust function, with no `no_mangle` or `extern "C"` needed.
+
+The library's test entry point in `lib.rs` uses the same macro (`entry_point!(test_kernel_main)`, only under `cfg(test)`). The integration tests in `tests/` still define `_start` by hand. That's fine because they don't need `BootInfo`.
+
+### Getting the level 4 table: `memory::init`
+
+```rust
+unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
+    let (level_4_table_frame, _) = Cr3::read();              // physical address
+    let phys = level_4_table_frame.start_address();
+    let virt = physical_memory_offset + phys.as_u64();       // where we can reach it
+    let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
+    unsafe { &mut *page_table_ptr }
+}
+```
+
+`memory::init` wraps that table in an `OffsetPageTable`, a type from the `x86_64` crate that knows the "physical + offset" trick and can translate addresses and create mappings for us.
+
+Both functions are `unsafe`, and the caller is responsible for two promises the compiler can't check:
+
+1. **All physical memory really is mapped at `physical_memory_offset`.** If not, the pointer arithmetic reads garbage.
+2. **`init` is called only once.** Each call creates a new `&'static mut` to the same level 4 table. Two mutable references to the same data break Rust's aliasing rules, which is undefined behaviour.
+
+### Translating by hand: `translate_addr`
+
+`translate_addr` does in software exactly what the MMU does in hardware, which makes it a good way to understand the walk:
+
+1. Read `CR3` to get the level 4 frame.
+2. For each level, use the matching 9-bit index from the address (`p4_index()`, `p3_index()`, ...).
+3. Turn the current table's frame into a virtual address (`offset + physical`) and read the entry.
+4. If the entry isn't present, return `None` (the address is unmapped). Otherwise continue with the frame it points to.
+5. After level 1, add the 12-bit page offset to the final frame address.
+
+The public `unsafe fn translate_addr` only wraps a safe inner function. This keeps the `unsafe` region small: the inner function is safe *given* the promise the caller made about the offset.
+
+It has one limitation. It panics on huge pages, and the bootloader may use huge pages for the physical memory mapping itself. `OffsetPageTable` handles huge pages correctly, so the kernel uses that, and `translate_addr` remains as a teaching example.
+
+---
+
+## 16. Creating a mapping
+
+**Files:** `src/memory.rs`, `src/main.rs`
+
+### `map_to` and frame allocators
+
+```rust
+pub fn create_example_mapping(
+    page: Page,
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
+    let frame = PhysFrame::containing_address(PhysAddr::new(0xb8000));   // the VGA buffer
+    let flags = Flags::PRESENT | Flags::WRITABLE;
+
+    let map_to_result = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
+    map_to_result.expect("map_to failed").flush();
+}
+```
+
+`map_to` writes a level 1 entry that points `page` at `frame` with the given flags. If a level 3, 2 or 1 table along the path doesn't exist yet, it needs a fresh physical frame to hold the new table. It asks the **frame allocator** for one.
+
+`map_to` returns a `MapperFlush`, which is marked `#[must_use]`. Calling `.flush()` runs `invlpg` for that page to clear its stale TLB entry, so the compiler warns you if you forget.
+
+`map_to` is `unsafe` because a mapping can break memory safety. For example, mapping a frame that is already in use somewhere else gives two writable views of the same memory.
+
+### Why the empty allocator works (for now)
+
+```rust
+pub struct EmptyFrameAllocator;
+
+unsafe impl FrameAllocator<Size4KiB> for EmptyFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> { None }
+}
+```
+
+This allocator never hands out a frame, so `map_to` can only succeed when every table along the path already exists. Virtual page `0` satisfies that. The bootloader runs in the first megabyte of the address space, so the level 3, 2 and 1 tables covering that region are already there. Page 0 itself is unmapped, so `map_to` only has to fill in one level 1 entry.
+
+Choose a page in an untouched region instead, such as `0xdeadbeaf000`, and `map_to` would need new tables, get `None` from the allocator, and the `expect` would panic with `map_to failed (FrameAllocationFailed)`. The next step of the post replaces this with a real allocator built from `boot_info.memory_map`.
+
+The allocator trait is `unsafe impl` because the implementer promises to hand out only frames that are actually free. Handing out a frame that's already in use would corrupt memory.
+
+### Seeing it work: "New!"
+
+```rust
+let page = Page::containing_address(VirtAddr::new(0));
+memory::create_example_mapping(page, &mut mapper, &mut frame_allocator);
+
+let vga_address = page.start_address() + 400 * size_of::<u64>() as u64;
+let vga_ptr = vga_address.as_mut_ptr::<u64>();
+unsafe { vga_ptr.write_volatile(0xf021_f877_f065_f04e) };
+```
+
+Virtual page 0 now maps to physical frame `0xb8000`, the VGA text buffer, so writing near virtual address 0 changes the screen:
+
+- **Where:** 400 × 8 = 3200 bytes into the page. Each screen cell is 2 bytes, so that's cell 1600, the start of row 20 (1600 ÷ 80).
+- **What:** x86 is little-endian, so the `u64` is stored as the bytes `4e f0 65 f0 77 f8 21 f0`. That's four cells of (character, color): `N`, `e`, `w`, `!`, with dark text on a light background.
+
+"New!" ends up one row higher than row 20 on screen, because the next `println!` scrolls everything up by one line.
+
+The VGA buffer can now be reached through two virtual addresses: `0xb8000`, which the `WRITER` uses, and page 0. Both lead to the same physical frame.
+
+**Side effect to be aware of:** with page 0 mapped, dereferencing a null pointer, or anything in the first 4 KiB, no longer page faults. Instead it silently reads or writes the VGA buffer. This is fine for a demonstration, but page 0 should be left unmapped once the real frame allocator arrives.
+
+---
+
+## 17. File map
 
 | File | Role |
 |---|---|
-| `src/main.rs` | Kernel entry point (`_start`), normal panic handler. |
-| `src/lib.rs` | `init()`, `hlt_loop()`, the test framework (`test_runner`, `Testable`), QEMU exit, test panic handler. |
+| `src/main.rs` | Kernel entry point (`kernel_main` via `entry_point!`), paging demo, normal panic handler. |
+| `src/lib.rs` | `init()`, `hlt_loop()`, test entry point (`test_kernel_main`), the test framework (`test_runner`, `Testable`), QEMU exit, test panic handler. |
 | `src/vga_buffer.rs` | VGA text-mode writer, `print!` and `println!` (interrupt-safe). |
 | `src/serial.rs` | UART serial output, `serial_print!` and `serial_println!` (interrupt-safe). |
-| `src/interrupts.rs` | IDT, exception handlers, PIC setup, timer and keyboard handlers. |
+| `src/interrupts.rs` | IDT, exception handlers (breakpoint, page fault, double fault), PIC setup, timer and keyboard handlers. |
+| `src/memory.rs` | Page table access (`init`, `OffsetPageTable`), manual `translate_addr`, example mapping, `EmptyFrameAllocator`. |
 | `src/gdt.rs` | GDT, TSS, double-fault IST stack. |
 | `tests/basic_boot.rs` | Integration test: printing works at boot. |
 | `tests/should_panic.rs` | Integration test: panics are reported. |
@@ -713,8 +959,8 @@ unsafe {
 
 | Crate | Used for |
 |---|---|
-| `bootloader` 0.9 | Bootloader that `bootimage` links with the kernel. |
-| `x86_64` | Safe wrappers for IDT, GDT, TSS, port I/O, and CPU instructions (`int3`, `sti`, `lidt`...). |
+| `bootloader` 0.9 | Bootloader that `bootimage` links with the kernel. Provides `entry_point!` and `BootInfo`. The `map_physical_memory` feature maps all RAM at `physical_memory_offset`. |
+| `x86_64` | Safe wrappers for IDT, GDT, TSS, page tables (`OffsetPageTable`, `Mapper`, `FrameAllocator`), control registers (`CR2`, `CR3`), port I/O, and CPU instructions (`int3`, `sti`, `lidt`, `invlpg`...). |
 | `pic8259` | `ChainedPics`: initializing and sending EOIs to the two 8259 PICs. |
 | `pc-keyboard` | Decodes PS/2 scancodes (set 1, US layout) into key events and characters. |
 | `uart_16550` | Serial port driver. |
@@ -724,7 +970,7 @@ unsafe {
 
 ---
 
-## 15. Running it
+## 18. Running it
 
 Requirements: a nightly Rust toolchain with `rust-src`, `llvm-tools-preview`, `bootimage` (`cargo install bootimage`), and QEMU.
 
