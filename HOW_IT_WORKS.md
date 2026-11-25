@@ -1,0 +1,542 @@
+# How rc_os Works
+
+rc_os is a small x86_64 kernel written in Rust. It follows Philipp Oppermann's [Writing an OS in Rust](https://os.phil-opp.com/) series. That series explains how to **build** each piece. This document explains how the pieces **work** once they are built: what the hardware does, what each file is responsible for, and how control moves from power-on to a blinking `.` on the screen.
+
+Current stage: **Hardware Interrupts**. The kernel boots, prints text, handles CPU exceptions, survives stack overflows, and receives timer interrupts.
+
+---
+
+## Table of contents
+
+1. [The big picture](#1-the-big-picture)
+2. [Building a kernel with no OS underneath](#2-building-a-kernel-with-no-os-underneath)
+3. [Boot: from power-on to `_start`](#3-boot-from-power-on-to-_start)
+4. [Printing to the screen: the VGA text buffer](#4-printing-to-the-screen-the-vga-text-buffer)
+5. [Printing to the host: the serial port](#5-printing-to-the-host-the-serial-port)
+6. [Testing inside QEMU](#6-testing-inside-qemu)
+7. [CPU exceptions and the IDT](#7-cpu-exceptions-and-the-idt)
+8. [Double faults, the GDT, and the TSS](#8-double-faults-the-gdt-and-the-tss)
+9. [Hardware interrupts: the PIC and the timer](#9-hardware-interrupts-the-pic-and-the-timer)
+10. [Shared state: why everything is a `Mutex` in a `lazy_static`](#10-shared-state-why-everything-is-a-mutex-in-a-lazy_static)
+11. [Known issue: the print deadlock](#11-known-issue-the-print-deadlock)
+12. [File map](#12-file-map)
+13. [Running it](#13-running-it)
+
+---
+
+## 1. The big picture
+
+```
+ ┌──────────────── QEMU (emulated x86_64 PC) ─────────────────┐
+ │                                                            │
+ │  BIOS ─► bootloader crate ─► _start()  (src/main.rs)       │
+ │                                  │                         │
+ │                                  ▼                         │
+ │                           rc_os::init()  (src/lib.rs)      │
+ │                 ┌────────────┬───┴──────────┬───────────┐  │
+ │                 ▼            ▼              ▼           ▼  │
+ │             gdt::init   init_idt()   PICS.initialize  sti  │
+ │             (GDT+TSS)   (handlers)   (remap IRQs)  (enable)│
+ │                                                            │
+ │  CPU exception ──► IDT ──► breakpoint / double fault       │
+ │  Timer chip ─► PIC ─► IDT[32] ──► timer_interrupt_handler  │
+ │                                                            │
+ │  println! ─► VGA buffer @ 0xb8000 ─► QEMU window           │
+ │  serial_println! ─► UART @ port 0x3F8 ─► your terminal     │
+ └────────────────────────────────────────────────────────────┘
+```
+
+The kernel is one Rust crate with two faces:
+
+- **`src/lib.rs`** is the library. All real functionality lives here so integration tests in `tests/` can reuse it.
+- **`src/main.rs`** is the kernel binary. It is a thin entry point that calls into the library.
+
+---
+
+## 2. Building a kernel with no OS underneath
+
+A normal Rust program assumes an operating system is present to provide threads, files, heap memory, and a way to start `main`. A kernel has none of that, so several settings work together to remove those assumptions.
+
+### `#![no_std]` and `#![no_main]`
+
+- `no_std` drops the standard library and links only `core`, the part of Rust that needs no OS: integers, slices, `Option`, formatting, and so on.
+- `no_main` drops the usual `main` entry point. The C runtime that would normally call `main` does not exist here. Instead we export a function named `_start`, the symbol the linker treats as the entry point by convention:
+
+  ```rust
+  #[unsafe(no_mangle)]               // keep the symbol name exactly "_start"
+  pub extern "C" fn _start() -> ! {  // C calling convention, never returns
+  ```
+
+  It returns `!` (never) because there is nothing to return to.
+
+### Panics
+
+With no OS there is no stack unwinding, so `Cargo.toml` sets `panic = "abort"`. We must also supply our own `#[panic_handler]`. In `main.rs` it prints the message to the screen and spins forever.
+
+### The custom target: `x86_64-rc_os.json`
+
+This file tells `rustc` what machine we are compiling for. The important fields:
+
+| Field | Value | Why |
+|---|---|---|
+| `llvm-target` | `x86_64-unknown-none` | 64-bit x86 with no OS. |
+| `linker` | `rust-lld` | LLVM's cross-platform linker, so we don't depend on the host's linker. |
+| `panic-strategy` | `abort` | Matches `Cargo.toml`. |
+| `disable-redzone` | `true` | The "red zone" is 128 bytes below the stack pointer that functions may use without moving the stack pointer. An interrupt can arrive at any moment and push its frame onto the stack, overwriting that area. Kernels must disable it. |
+| `features` | `-mmx,-sse,+soft-float` | SIMD registers are large. Using them in the kernel would force us to save and restore them on every interrupt. We turn them off and do floating-point math in software instead. |
+
+### `.cargo/config.toml`
+
+```toml
+[build]
+target = "x86_64-rc_os.json"         # always build for our custom target
+
+[unstable]
+build-std = ["core", "compiler_builtins"]   # compile core from source for our target
+build-std-features = ["compiler-builtins-mem"]  # provide memcpy/memset/etc.
+
+[target.'cfg(target_os = "none")']
+runner = "bootimage runner"          # `cargo run` / `cargo test` launch QEMU
+```
+
+There is no precompiled `core` for a custom target, so `build-std` compiles it from source. That is why this project needs a **nightly** toolchain. `compiler-builtins-mem` supplies `memcpy` and related functions that the compiler emits calls to, which would normally come from the C library.
+
+### `bootimage` and the `bootloader` crate
+
+The compiled kernel is an ELF file. A PC cannot boot an ELF file directly. The `bootimage` tool:
+
+1. compiles the `bootloader` crate (v0.9),
+2. links our kernel ELF into it, and
+3. produces a raw disk image (`bootimage-rc_os.bin`) that QEMU can boot.
+
+This is also why `cargo` warns that `bootloader` is an "unused dependency": our code never calls it, but `bootimage` needs it in `Cargo.toml`.
+
+---
+
+## 3. Boot: from power-on to `_start`
+
+1. **BIOS** runs from firmware, finds the bootable disk, and loads its first 512 bytes.
+2. **The bootloader** (from the `bootloader` crate) takes over. The CPU starts in 16-bit *real mode*, and the bootloader moves it through 32-bit *protected mode* into 64-bit *long mode*. It sets up an initial page table, loads our kernel from the disk image, sets up a stack, and jumps to `_start`.
+3. **`_start`** (`src/main.rs`):
+
+   ```rust
+   println!("Hello World{}", "!");
+   rc_os::init();          // GDT, IDT, PIC, enable interrupts
+   #[cfg(test)] test_main();
+   println!("It did not crash!");
+   loop {}                 // the kernel never exits
+   ```
+
+`loop {}` busy-spins the CPU at 100%. A later post replaces it with the `hlt` instruction, which sleeps until the next interrupt.
+
+---
+
+## 4. Printing to the screen: the VGA text buffer
+
+**File:** `src/vga_buffer.rs`
+
+In VGA text mode, the screen is a grid of 80 columns by 25 rows. That grid is **memory-mapped** at physical address `0xb8000`, so writing bytes to that address puts characters on the screen. No driver is needed.
+
+Each cell is 2 bytes:
+
+```
+ byte 0: ASCII code         byte 1: color
+                            ┌─────────┬──────────┐
+                            │bg (4bit)│fg (4bit) │
+                            └─────────┴──────────┘
+```
+
+The code mirrors that layout exactly:
+
+- `Color` is a `#[repr(u8)]` enum of the 16 VGA colors.
+- `ColorCode(u8)` packs background and foreground: `(bg << 4) | fg`.
+- `ScreenChar` is `#[repr(C)]` so Rust keeps the field order (character, then color).
+- `Buffer` is a 25×80 array of `ScreenChar`, and is `#[repr(transparent)]` so it has the same layout as the raw memory.
+
+### Why `Volatile`?
+
+The compiler sees that we write to the buffer but never read it back, so it could decide those writes are useless and delete them. `Volatile<ScreenChar>` forces every read and write to actually happen, because they have side effects the compiler can't see (characters appearing on screen).
+
+### The `Writer`
+
+`Writer` always writes to the **bottom row**. On a newline, or when the row is full, `new_line()` copies every row up by one and clears the bottom row. That is how scrolling works. Bytes outside printable ASCII are shown as `■` (`0xfe`).
+
+`Writer` implements `core::fmt::Write`, which gives us Rust's formatting machinery (`{}`, `{:?}`, `{:#?}`) for free.
+
+### The global `WRITER` and `println!`
+
+```rust
+lazy_static! {
+    pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
+        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+        ...
+    });
+}
+```
+
+`print!` and `println!` are macros that call `vga_buffer::_print`, which locks `WRITER` and writes the formatted text. Section 10 explains why this is a `Mutex` inside a `lazy_static`.
+
+---
+
+## 5. Printing to the host: the serial port
+
+**File:** `src/serial.rs`
+
+The VGA buffer is only visible inside the QEMU window. For tests we want output in the terminal that ran `cargo test`. The old **UART 16550** serial chip makes this possible:
+
+- The kernel writes bytes to I/O port `0x3F8` (COM1).
+- QEMU is started with `-serial stdio` (see `[package.metadata.bootimage]` in `Cargo.toml`), so whatever the guest writes to COM1 appears on the host's stdout.
+
+`serial_print!` and `serial_println!` work like `print!` and `println!`, but go through a `SERIAL1` mutex instead of `WRITER`.
+
+**Port I/O vs. memory-mapped I/O:** x86 has a separate 16-bit "port" address space accessed with the special `in` and `out` instructions. The VGA buffer is memory-mapped (normal memory writes). The serial chip, the PIC, and QEMU's exit device all use ports.
+
+---
+
+## 6. Testing inside QEMU
+
+Rust's built-in test framework depends on `std`, so this project uses the unstable **custom test frameworks** feature.
+
+### How a unit test run works
+
+```rust
+#![feature(custom_test_frameworks)]
+#![test_runner(crate::test_runner)]
+#![reexport_test_harness_main = "test_main"]
+```
+
+1. The compiler collects every function marked `#[test_case]`.
+2. It generates a function, which we rename to `test_main`, that passes them all as a slice to our `test_runner`.
+3. When built with `cfg(test)`, `_start` calls `test_main()`.
+4. `test_runner` calls each test through the `Testable` trait, which prints `name...\t[ok]` over serial.
+5. When all tests pass, it calls `exit_qemu(Success)`.
+
+### Shutting QEMU down from inside the guest
+
+QEMU normally runs until you close it. The test config adds a special device:
+
+```
+-device isa-debug-exit,iobase=0xf4,iosize=0x04
+```
+
+When the guest writes a value `v` to port `0xf4`, QEMU exits with status `(v << 1) | 1`.
+
+| Kernel writes | QEMU exit status | Meaning |
+|---|---|---|
+| `0x10` (`Success`) | `(0x10 << 1) \| 1 = 33` | `test-success-exit-code = 33` tells `bootimage` this means pass. |
+| `0x11` (`Failed`) | `35` | Anything other than 33 counts as failure. |
+
+`-display none` hides the window during tests, and `test-timeout = 300` kills a run that hangs, such as one stuck in an infinite loop or a deadlock.
+
+### Integration tests (`tests/`)
+
+Each file in `tests/` is compiled as its **own separate kernel** with its own `_start` and panic handler. It links against the `rc_os` library.
+
+| Test | What it proves | How |
+|---|---|---|
+| `basic_boot.rs` | `println!` works right after boot, before `init()`. | Normal test runner. |
+| `should_panic.rs` | Panics are detected correctly. | `harness = false`. The panic handler *reports success*, and returning normally reports failure. |
+| `stack_overflow.rs` | A stack overflow becomes a handled double fault, not a reboot. | Sets up its own IDT whose double-fault handler exits QEMU with `Success`. See section 8. |
+
+---
+
+## 7. CPU exceptions and the IDT
+
+**File:** `src/interrupts.rs`
+
+An **exception** is the CPU telling the kernel that something went wrong, or needs attention, while running the current instruction. Examples: divide by zero, page fault, invalid opcode, or the `int3` breakpoint instruction.
+
+When this happens the CPU:
+
+1. Looks up the exception number in the **Interrupt Descriptor Table (IDT)**.
+2. Pushes an **interrupt stack frame** onto the stack: the instruction pointer, code segment, flags, stack pointer, and stack segment at the moment of the exception. Some exceptions also push an error code.
+3. Jumps to the handler address stored in the IDT entry.
+
+The IDT has 256 entries. The first 32 (0–31) are reserved for CPU exceptions. The rest are free for hardware and software interrupts.
+
+### The `x86-interrupt` calling convention
+
+A normal function call has rules about which registers the caller saves and which the callee saves. An interrupt can arrive *between any two instructions*, so the interrupted code had no chance to save anything. A handler must therefore preserve **every** register it touches and return with the special `iretq` instruction instead of `ret`.
+
+`extern "x86-interrupt" fn` (enabled by `#![feature(abi_x86_interrupt)]`) tells the compiler to generate exactly that code. We write ordinary Rust and the compiler handles the save, restore, and `iretq`.
+
+### Our IDT
+
+```rust
+lazy_static! {
+    static ref IDT: InterruptDescriptorTable = {
+        let mut idt = InterruptDescriptorTable::new();
+        idt.breakpoint.set_handler_fn(breakpoint_handler);              // vector 3
+        idt.double_fault.set_handler_fn(double_fault_handler)           // vector 8
+            .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+        idt[InterruptionIndex::Timer.as_u8()]                           // vector 32
+            .set_handler_fn(timer_interrupt_handler);
+        idt
+    };
+}
+```
+
+`init_idt()` calls `IDT.load()`, which runs the `lidt` instruction to tell the CPU where the table lives. The table must stay valid for the whole life of the kernel. That is why it is a `static` and not a local variable.
+
+- **Breakpoint (3):** prints the stack frame and **returns**, so execution continues after the `int3`. The `test_breakpoint_exception` test checks exactly this: if the handler were broken, the test kernel would crash.
+- **Double fault (8):** returns `!` and panics. See the next section.
+
+---
+
+## 8. Double faults, the GDT, and the TSS
+
+**File:** `src/gdt.rs`
+
+### What is a double fault?
+
+If the CPU hits an exception *while trying to call the handler for a previous exception* (for example, the handler is missing, or pushing the stack frame itself faults), it raises a **double fault** (vector 8). If calling the double-fault handler also fails, that is a **triple fault**. The CPU resets, and QEMU reboots in a loop.
+
+### The stack overflow problem
+
+Consider a stack overflow:
+
+1. Infinite recursion runs the stack pointer into the **guard page**, an unmapped page the bootloader places below the stack.
+2. The CPU raises a **page fault** and tries to push the exception frame onto the stack...
+3. ...but the stack pointer still points into the guard page, so the push faults again → **double fault**.
+4. The CPU tries to push a frame for the double fault, onto the same broken stack → **triple fault** → reboot.
+
+The fix is to make the CPU **switch to a known-good stack** before calling the double-fault handler.
+
+### The Interrupt Stack Table (IST)
+
+x86_64 provides the IST: a list of up to 7 alternate stack pointers. An IDT entry can say "always switch to IST stack *N* before calling me". That is what `.set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX)` does.
+
+The IST lives inside a structure called the **Task State Segment (TSS)**. In 64-bit mode the TSS no longer manages tasks (its 32-bit purpose). It is now mostly a holder for these stack pointers.
+
+```rust
+static ref TSS: TaskStateSegment = {
+    let mut tss = TaskStateSegment::new();
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
+        const STACK_SIZE: usize = 4096 * 5;           // 20 KiB
+        static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+        let stack_start = VirtAddr::from_ptr(&raw const STACK);
+        stack_start + STACK_SIZE as u64               // stacks grow DOWN, so give the END address
+    };
+    tss
+};
+```
+
+The stack is a plain `static` array. There is no memory allocator yet. It also has no guard page of its own, so a double-fault handler that used too much stack would silently corrupt memory. This is acceptable for now.
+
+### The Global Descriptor Table (GDT)
+
+The CPU can't be handed a TSS directly. It must be referenced through a **segment descriptor** in the **Global Descriptor Table (GDT)**. In 64-bit mode, segmentation is mostly disabled, but the GDT survives for two jobs: holding the kernel code segment and holding the TSS descriptor.
+
+```rust
+let code_selector = gdt.append(Descriptor::kernel_code_segment());
+let tss_selector  = gdt.append(Descriptor::tss_segment(&TSS));
+```
+
+`gdt::init()` then:
+
+1. loads the GDT (`lgdt`),
+2. reloads the code segment register `CS` with our new code selector, because the old value pointed into the bootloader's GDT, and
+3. loads the TSS (`ltr`) so the CPU knows where the IST is.
+
+These are `unsafe` because a wrong selector breaks memory safety in ways the compiler can't check.
+
+### Putting it together
+
+```
+stack overflow ─► page fault ─► can't push frame ─► DOUBLE FAULT
+                                                        │
+                         IDT[8] says "use IST[0]"  ◄────┘
+                                  │
+               TSS.ist[0] = top of 20 KiB static STACK
+                                  │
+                 CPU switches stacks, pushes frame safely
+                                  │
+                     double_fault_handler runs ✔
+```
+
+`tests/stack_overflow.rs` checks this whole chain. It recurses forever, and its custom double-fault handler exits QEMU with `Success`.
+
+### Initialization order matters
+
+`init()` calls `gdt::init()` **before** `init_idt()`. The IDT's double-fault entry refers to IST index 0, which only means something once the TSS is loaded.
+
+---
+
+## 9. Hardware interrupts: the PIC and the timer
+
+**Files:** `src/interrupts.rs`, `src/lib.rs`. This matches the [Hardware Interrupts](https://os.phil-opp.com/hardware-interrupts/) post.
+
+Exceptions come from the CPU itself. **Hardware interrupts** come from external devices (timer, keyboard, disk) to say "something happened, come look". They let the CPU react to events instead of constantly checking (*polling*) every device.
+
+### The 8259 PIC
+
+On a classic PC, devices don't connect to the CPU directly. They connect to a **Programmable Interrupt Controller**. There are two 8259 chips, *chained*: the secondary PIC's output feeds into line 2 of the primary.
+
+```
+                     ┌──────────────┐        ┌──────────────┐
+ Timer (PIT) ─ IRQ0 ─┤              │        │              ├─ IRQ8  RTC
+ Keyboard    ─ IRQ1 ─┤   Primary    │◄─IRQ2──┤  Secondary   ├─ IRQ9..11
+                     │    PIC       │        │    PIC       ├─ IRQ12 Mouse
+ COM2/COM1   ─ IRQ3/4┤  (ports      │        │  (ports      ├─ IRQ13 FPU
+ ...         ─ IRQ5-7┤  0x20/0x21)  │        │  0xA0/0xA1)  ├─ IRQ14/15 ATA
+                     └──────┬───────┘        └──────────────┘
+                            │ "interrupt vector N"
+                            ▼
+                           CPU ──► IDT[N]
+```
+
+Each PIC turns an IRQ line into an **interrupt vector number** for the CPU to look up in the IDT.
+
+### Remapping: why the offsets are 32 and 40
+
+By default the primary PIC maps IRQ 0–7 to vectors **8–15**. Those collide with CPU exceptions: IRQ0 (the timer) would arrive as vector 8, which looks exactly like a **double fault**. So we reprogram the PICs to use vectors after the 32 reserved exception slots:
+
+```rust
+pub const PIC_1_OFFSET: u8 = 32;                  // IRQ0–7  → vectors 32–39
+pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;    // IRQ8–15 → vectors 40–47
+
+pub static PICS: spin::Mutex<ChainedPics> =
+    spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+```
+
+`PICS.lock().initialize()` (called from `init()`) sends the PICs their initialization command words over their I/O ports, including these offsets. `ChainedPics::new` is `unsafe` because wrong offsets would make device interrupts look like CPU exceptions.
+
+### Naming vectors: `InterruptionIndex`
+
+```rust
+#[repr(u8)]
+pub enum InterruptionIndex {
+    Timer = PIC_1_OFFSET,   // IRQ0 → vector 32
+}
+```
+
+This gives vector numbers readable names. More entries (such as `Keyboard`, which will be `PIC_1_OFFSET + 1`) are added as more devices are handled.
+
+### Turning interrupts on
+
+```rust
+pub fn init() {
+    gdt::init();
+    interrupts::init_idt();
+    unsafe { interrupts::PICS.lock().initialize() };
+    x86_64::instructions::interrupts::enable();   // the `sti` instruction
+}
+```
+
+The CPU ignores hardware interrupts until the interrupt flag is set with `sti`. The order is deliberate: the IDT must contain the timer handler **before** we enable interrupts. Otherwise the first tick would hit an empty IDT entry, causing a fault that becomes a double fault.
+
+### The timer handler
+
+The **PIT** (Programmable Interval Timer) is wired to IRQ0. Without any configuration it fires about 18.2 times per second.
+
+```rust
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    print!(".");
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(InterruptionIndex::Timer.as_u8());
+    }
+}
+```
+
+### End of Interrupt (EOI)
+
+The PIC won't deliver another interrupt from a line until the kernel confirms the current one has been handled. That confirmation is the **End of Interrupt** command. Without it you'd see exactly one `.` and then nothing. `ChainedPics` works out from the vector number whether only the primary PIC needs the EOI, or both (for IRQ 8–15).
+
+The result: after boot, a stream of dots is printed across the screen, one per timer tick.
+
+---
+
+## 10. Shared state: why everything is a `Mutex` in a `lazy_static`
+
+The globals `WRITER`, `SERIAL1`, `IDT`, `GDT`, `TSS`, and `PICS` all follow similar patterns, for two separate reasons.
+
+### `lazy_static!`: initialization that can't happen at compile time
+
+Rust `static`s must be computed at compile time. Building an IDT, calling `Uart16550Tty::new_port`, or turning a raw pointer into a reference can't be done in a `const` context. `lazy_static!` delays initialization until the first time the value is accessed. The `spin_no_std` feature makes it work without `std`.
+
+`PICS` does not need `lazy_static` because `ChainedPics::new` and `spin::Mutex::new` are both `const fn`.
+
+### `spin::Mutex`: mutation of a global
+
+`WRITER`, `SERIAL1`, and `PICS` need to be changed after creation, and Rust rightly forbids `static mut` access without `unsafe`. A mutex provides safe interior mutability. There is no OS to put a waiting thread to sleep, so we use a **spinlock**: a thread that wants the lock loops until it's free.
+
+`IDT`, `GDT`, and `TSS` are never changed after creation, so they need no mutex.
+
+---
+
+## 11. Known issue: the print deadlock
+
+> This is the exact problem covered in the **"Deadlocks"** section of the Hardware Interrupts post, and the fix is the next step there.
+
+With interrupts enabled, the following can happen:
+
+```
+ main code                         timer interrupt
+ ─────────                         ───────────────
+ println!("...")
+   WRITER.lock()   ✔ lock held
+   writing bytes...
+        ◄──────── tick! CPU jumps into handler ────────
+                                   print!(".")
+                                     WRITER.lock()  ✖ already held
+                                     spin... spin... forever
+```
+
+The interrupt handler waits for a lock that the interrupted code holds. That code can't continue until the handler returns. Neither side can move: a **deadlock**.
+
+You can reproduce it today. `cargo test` hangs in `test_println_many`, which prints 200 lines so a timer tick is almost certain to land mid-print, and then `bootimage` times out.
+
+**The fix** (next part of the post): disable interrupts while holding the lock, in both `vga_buffer::_print` and `serial::_print`:
+
+```rust
+x86_64::instructions::interrupts::without_interrupts(|| {
+    WRITER.lock().write_fmt(args).unwrap();
+});
+```
+
+A related race affects `test_println_output`. A timer `.` can land between the `println!` and the check of the screen contents, which moves the text. The post fixes this by holding the lock and disabling interrupts for the whole test.
+
+---
+
+## 12. File map
+
+| File | Role |
+|---|---|
+| `src/main.rs` | Kernel entry point (`_start`), normal panic handler. |
+| `src/lib.rs` | `init()`, the test framework (`test_runner`, `Testable`), QEMU exit, test panic handler. |
+| `src/vga_buffer.rs` | VGA text-mode writer, `print!` and `println!`. |
+| `src/serial.rs` | UART serial output, `serial_print!` and `serial_println!`. |
+| `src/interrupts.rs` | IDT, exception handlers, PIC setup, timer handler. |
+| `src/gdt.rs` | GDT, TSS, double-fault IST stack. |
+| `tests/basic_boot.rs` | Integration test: printing works at boot. |
+| `tests/should_panic.rs` | Integration test: panics are reported. |
+| `tests/stack_overflow.rs` | Integration test: stack overflow → handled double fault. |
+| `x86_64-rc_os.json` | Custom compilation target (bare metal, no red zone, no SIMD). |
+| `.cargo/config.toml` | Default target, `build-std`, `bootimage` runner. |
+| `Cargo.toml` | Dependencies, `panic = "abort"`, QEMU test arguments. |
+
+### Dependencies
+
+| Crate | Used for |
+|---|---|
+| `bootloader` 0.9 | Bootloader that `bootimage` links with the kernel. |
+| `x86_64` | Safe wrappers for IDT, GDT, TSS, port I/O, and CPU instructions (`int3`, `sti`, `lidt`...). |
+| `pic8259` | `ChainedPics`: initializing and sending EOIs to the two 8259 PICs. |
+| `uart_16550` | Serial port driver. |
+| `spin` | Spinlock `Mutex` for `no_std`. |
+| `lazy_static` | Statics that are initialized at runtime. |
+| `volatile` | Prevents the compiler from optimizing away VGA buffer writes. |
+
+---
+
+## 13. Running it
+
+Requirements: a nightly Rust toolchain with `rust-src`, `llvm-tools-preview`, `bootimage` (`cargo install bootimage`), and QEMU.
+
+```sh
+cargo run          # build the disk image and boot it in QEMU
+cargo test         # run unit + integration tests headless; results print to your terminal
+cargo test --test stack_overflow   # run a single integration test
+```
+
+To debug a triple-fault reboot loop, add `-no-reboot` to the QEMU arguments (bootimage already passes it during `cargo test`). Adding `-d int` shows every interrupt and exception QEMU delivers.
