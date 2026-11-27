@@ -2,7 +2,7 @@
 
 rc_os is a small x86_64 kernel written in Rust. It follows Philipp Oppermann's [Writing an OS in Rust](https://os.phil-opp.com/) series. That series explains how to **build** each piece. This document explains how the pieces **work** once they are built: what the hardware does, what each file is responsible for, and how control moves from power-on to text appearing as you type.
 
-Current stage: **Paging Implementation** (through "Creating a New Mapping"). The kernel boots, prints text, handles CPU exceptions and page faults, survives stack overflows, handles timer and keyboard interrupts, can read and modify its own page tables, and maps a virtual page to the VGA buffer.
+Current stage: **Paging Implementation** (through "Allocating Frames"). The kernel boots, prints text, handles CPU exceptions and page faults, survives stack overflows, handles timer and keyboard interrupts, can read and modify its own page tables, allocates physical frames from the bootloader's memory map, and maps a virtual page to the VGA buffer.
 
 ---
 
@@ -132,6 +132,7 @@ The kernel also uses the `bootloader` crate directly. Its `entry_point!` macro a
    rc_os::init();          // GDT, IDT, PIC, enable interrupts
    // paging demo: get the page tables, map page 0 to the VGA buffer, write "New!"
    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+   let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
    memory::create_example_mapping(page, &mut mapper, &mut frame_allocator);
    #[cfg(test)] test_main();
    println!("It did not crash!");
@@ -822,7 +823,7 @@ The bootloader chooses the offset, so the kernel has to be told what it is.
 
 ### `entry_point!` and `BootInfo`
 
-The bootloader passes a pointer to a **`BootInfo`** struct as the first argument to the entry point. It contains `physical_memory_offset` and also a `memory_map` of which physical regions are usable RAM, which the next step of the post uses.
+The bootloader passes a pointer to a **`BootInfo`** struct as the first argument to the entry point. It contains `physical_memory_offset` and also a `memory_map` of which physical regions are usable RAM, which the frame allocator uses (section 16).
 
 We could just add a `&'static BootInfo` parameter to `_start`, but nothing would check that the signature matches what the bootloader really passes. The `entry_point!` macro solves this:
 
@@ -897,7 +898,7 @@ pub fn create_example_mapping(
 
 `map_to` is `unsafe` because a mapping can break memory safety. For example, mapping a frame that is already in use somewhere else gives two writable views of the same memory.
 
-### Why the empty allocator works (for now)
+### The empty allocator, and why it was enough for page 0
 
 ```rust
 pub struct EmptyFrameAllocator;
@@ -909,9 +910,64 @@ unsafe impl FrameAllocator<Size4KiB> for EmptyFrameAllocator {
 
 This allocator never hands out a frame, so `map_to` can only succeed when every table along the path already exists. Virtual page `0` satisfies that. The bootloader runs in the first megabyte of the address space, so the level 3, 2 and 1 tables covering that region are already there. Page 0 itself is unmapped, so `map_to` only has to fill in one level 1 entry.
 
-Choose a page in an untouched region instead, such as `0xdeadbeaf000`, and `map_to` would need new tables, get `None` from the allocator, and the `expect` would panic with `map_to failed (FrameAllocationFailed)`. The next step of the post replaces this with a real allocator built from `boot_info.memory_map`.
+Choose a page in an untouched region instead, such as `0xdeadbeaf000`, and `map_to` would need new tables, get `None` from the allocator, and the `expect` would panic with `map_to failed (FrameAllocationFailed)`. That's why the next step replaces it with a real allocator.
 
 The allocator trait is `unsafe impl` because the implementer promises to hand out only frames that are actually free. Handing out a frame that's already in use would corrupt memory.
+
+`EmptyFrameAllocator` is still in `memory.rs`, but `main.rs` no longer uses it.
+
+### A real allocator: `BootInfoFrameAllocator`
+
+To create mappings anywhere, the kernel needs to know which physical frames are **free**. The bootloader already knows: before jumping to the kernel, it asks the BIOS for the machine's memory layout (the "E820" memory map). It then marks the regions it used itself, such as the kernel image, the page tables, the boot stack and the `BootInfo` struct. The result arrives as `boot_info.memory_map`, a list of regions with a type for each one:
+
+| `MemoryRegionType` | Meaning |
+|---|---|
+| `Usable` | Free RAM. Safe to hand out. |
+| `InUse`, `Kernel`, `KernelStack`, `PageTable`, `Bootloader`, `BootInfo`... | Already used by the bootloader or the kernel. |
+| `Reserved`, `AcpiReclaimable`, `AcpiNvs`, `BadMemory` | Firmware, hardware, or memory the CPU must not touch. |
+
+`BootInfoFrameAllocator` hands out the `Usable` frames one by one:
+
+```rust
+pub struct BootInfoFrameAllocator {
+    memory_map: &'static MemoryMap,   // borrowed from BootInfo, which lives forever
+    next: usize,                      // how many frames have been handed out so far
+}
+```
+
+`usable_frames()` turns the memory map into a stream of frames using an iterator chain:
+
+```
+ memory_map.iter()                                every region
+   .filter(region_type == Usable)                 only free RAM
+   .map(start_addr()..end_addr())                 e.g. 0x10_0000..0x7fe_0000
+   .flat_map(range.step_by(4096))                 0x10_0000, 0x10_1000, 0x10_2000, ...
+   .map(PhysFrame::containing_address)            frame, frame, frame, ...
+```
+
+`allocate_frame` returns the frame at position `next` and moves `next` forward:
+
+```rust
+fn allocate_frame(&mut self) -> Option<PhysFrame> {
+    let frame = self.usable_frames().nth(self.next)?;   // `?` returns None when out of memory
+    self.next += 1;
+    Some(frame)
+}
+```
+
+This is a **bump allocator** for frames: it only moves forward and can never take a frame back. It's also simple rather than fast. The iterator is rebuilt from scratch on every call and skips `next` frames to reach the right one, so allocation gets slower as more frames are handed out. The post does it this way because a Rust struct can't easily store an `impl Iterator` field. It's fine for the handful of page tables the kernel creates at this stage.
+
+`init` is `unsafe`, and its `/// # Safety` comment states what the caller promises:
+
+1. The memory map is accurate. A region marked `Usable` that is really in use would be handed out and overwritten.
+2. No one else hands out these frames. Two allocators working from the same map would give the same frame to two owners.
+
+#### When does `map_to` actually call it?
+
+Only when a page table along the path is missing. In this project:
+
+- **Page `0` (what `main.rs` maps now):** every table already exists, so the allocator is never asked for a frame. The code behaves exactly as it did with `EmptyFrameAllocator`.
+- **Page `0xdeadbeaf000` (the post's example):** nothing in that region of the address space is mapped, so `map_to` asks the allocator for up to three frames, one each for the new level 3, level 2 and level 1 tables. Change the address in `main.rs` and "New!" still appears, which shows the new tables were created. With `EmptyFrameAllocator`, the same change panics with `FrameAllocationFailed`.
 
 ### Seeing it work: "New!"
 
@@ -933,7 +989,7 @@ Virtual page 0 now maps to physical frame `0xb8000`, the VGA text buffer, so wri
 
 The VGA buffer can now be reached through two virtual addresses: `0xb8000`, which the `WRITER` uses, and page 0. Both lead to the same physical frame.
 
-**Side effect to be aware of:** with page 0 mapped, dereferencing a null pointer, or anything in the first 4 KiB, no longer page faults. Instead it silently reads or writes the VGA buffer. This is fine for a demonstration, but page 0 should be left unmapped once the real frame allocator arrives.
+**Side effect to be aware of:** with page 0 mapped, dereferencing a null pointer, or anything in the first 4 KiB, no longer page faults. Instead it silently reads or writes the VGA buffer. This is fine for a demonstration. Now that the real frame allocator exists, the example can be moved to a page like `0xdeadbeaf000`, so page 0 stays unmapped and null pointers fault again.
 
 ---
 
@@ -946,7 +1002,7 @@ The VGA buffer can now be reached through two virtual addresses: `0xb8000`, whic
 | `src/vga_buffer.rs` | VGA text-mode writer, `print!` and `println!` (interrupt-safe). |
 | `src/serial.rs` | UART serial output, `serial_print!` and `serial_println!` (interrupt-safe). |
 | `src/interrupts.rs` | IDT, exception handlers (breakpoint, page fault, double fault), PIC setup, timer and keyboard handlers. |
-| `src/memory.rs` | Page table access (`init`, `OffsetPageTable`), manual `translate_addr`, example mapping, `EmptyFrameAllocator`. |
+| `src/memory.rs` | Page table access (`init`, `OffsetPageTable`), manual `translate_addr`, example mapping, `EmptyFrameAllocator`, `BootInfoFrameAllocator`. |
 | `src/gdt.rs` | GDT, TSS, double-fault IST stack. |
 | `tests/basic_boot.rs` | Integration test: printing works at boot. |
 | `tests/should_panic.rs` | Integration test: panics are reported. |
