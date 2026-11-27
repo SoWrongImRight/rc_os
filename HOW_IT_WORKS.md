@@ -2,7 +2,7 @@
 
 rc_os is a small x86_64 kernel written in Rust. It follows Philipp Oppermann's [Writing an OS in Rust](https://os.phil-opp.com/) series. That series explains how to **build** each piece. This document explains how the pieces **work** once they are built: what the hardware does, what each file is responsible for, and how control moves from power-on to text appearing as you type.
 
-Current stage: **Paging Implementation** (through "Allocating Frames"). The kernel boots, prints text, handles CPU exceptions and page faults, survives stack overflows, handles timer and keyboard interrupts, can read and modify its own page tables, allocates physical frames from the bootloader's memory map, and maps a virtual page to the VGA buffer.
+Current stage: **Heap Allocation** (using `linked_list_allocator`). The kernel boots, prints text, handles CPU exceptions and page faults, survives stack overflows, handles timer and keyboard interrupts, manages its own page tables, allocates physical frames from the bootloader's memory map, and has a 100 KiB heap, so `Box`, `Vec` and `Rc` work.
 
 ---
 
@@ -24,8 +24,9 @@ Current stage: **Paging Implementation** (through "Allocating Frames"). The kern
 14. [Paging: virtual memory](#14-paging-virtual-memory)
 15. [Reaching the page tables: `BootInfo` and the physical memory offset](#15-reaching-the-page-tables-bootinfo-and-the-physical-memory-offset)
 16. [Creating a mapping](#16-creating-a-mapping)
-17. [File map](#17-file-map)
-18. [Running it](#18-running-it)
+17. [Heap allocation](#17-heap-allocation)
+18. [File map](#18-file-map)
+19. [Running it](#19-running-it)
 
 ---
 
@@ -100,7 +101,7 @@ This file tells `rustc` what machine we are compiling for. The important fields:
 target = "x86_64-rc_os.json"         # always build for our custom target
 
 [unstable]
-build-std = ["core", "compiler_builtins"]   # compile core from source for our target
+build-std = ["core", "compiler_builtins", "alloc"]   # compile core (and alloc, section 17) from source
 build-std-features = ["compiler-builtins-mem"]  # provide memcpy/memset/etc.
 
 [target.'cfg(target_os = "none")']
@@ -134,6 +135,9 @@ The kernel also uses the `bootloader` crate directly. Its `entry_point!` macro a
    let mut mapper = unsafe { memory::init(phys_mem_offset) };
    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
    memory::create_example_mapping(page, &mut mapper, &mut frame_allocator);
+   allocator::init_heap(&mut mapper, &mut frame_allocator)   // section 17
+       .expect("heap initialization failed");
+   // heap demo: Box, Vec, Rc
    #[cfg(test)] test_main();
    println!("It did not crash!");
    rc_os::hlt_loop();      // the kernel never exits; sleep until each interrupt
@@ -249,6 +253,7 @@ Each file in `tests/` is compiled as its **own separate kernel** with its own `_
 | `basic_boot.rs` | `println!` works right after boot, before `init()`. | Normal test runner. |
 | `should_panic.rs` | Panics are detected correctly. | `harness = false`. The panic handler *reports success*, and returning normally reports failure. |
 | `stack_overflow.rs` | A stack overflow becomes a handled double fault, not a reboot. | Sets up its own IDT whose double-fault handler exits QEMU with `Success`. See section 8. |
+| `heap_allocation.rs` | `Box` and `Vec` work, and freed memory is reused. | Sets up paging, the frame allocator and the heap itself before running its tests. See section 17. |
 
 ---
 
@@ -338,7 +343,7 @@ static ref TSS: TaskStateSegment = {
 };
 ```
 
-The stack is a plain `static` array. There is no memory allocator yet. It also has no guard page of its own, so a double-fault handler that used too much stack would silently corrupt memory. This is acceptable for now.
+The stack is a plain `static` array, because the heap (section 17) is set up much later in boot, long after this stack must already exist. It also has no guard page of its own, so a double-fault handler that used too much stack would silently corrupt memory. This is acceptable for now.
 
 ### The Global Descriptor Table (GDT)
 
@@ -968,6 +973,7 @@ Only when a page table along the path is missing. In this project:
 
 - **Page `0` (what `main.rs` maps now):** every table already exists, so the allocator is never asked for a frame. The code behaves exactly as it did with `EmptyFrameAllocator`.
 - **Page `0xdeadbeaf000` (the post's example):** nothing in that region of the address space is mapped, so `map_to` asks the allocator for up to three frames, one each for the new level 3, level 2 and level 1 tables. Change the address in `main.rs` and "New!" still appears, which shows the new tables were created. With `EmptyFrameAllocator`, the same change panics with `FrameAllocationFailed`.
+- **The heap (section 17):** `init_heap` maps 25 pages in a previously unused region, so it really uses the allocator: 25 frames for the heap plus 3 for new page tables.
 
 ### Seeing it work: "New!"
 
@@ -993,7 +999,133 @@ The VGA buffer can now be reached through two virtual addresses: `0xb8000`, whic
 
 ---
 
-## 17. File map
+## 17. Heap allocation
+
+**Files:** `src/allocator.rs`, `src/main.rs`, `src/lib.rs`, `.cargo/config.toml`, `tests/heap_allocation.rs`. This matches the [Heap Allocation](https://os.phil-opp.com/heap-allocation/) post.
+
+### Why a heap?
+
+Until now, the kernel had two kinds of memory:
+
+- **Static memory** (`static` items) exists for the whole run. Its size must be known at compile time.
+- **Stack memory** (local variables) is fast, but it's freed as soon as the function returns, and its size must also be known at compile time.
+
+Neither works for data whose size is only known at runtime, such as a list that grows, or for data that has to outlive the function that created it but not live forever. That needs a **heap**: a region of memory that code can ask for pieces of (`alloc`) and give back (`dealloc`) at any time.
+
+### The `alloc` crate
+
+Rust's standard library splits heap types out into the `alloc` crate: `Box`, `Vec`, `String`, `Rc`, `BTreeMap` and so on. `alloc` doesn't need an OS. It only needs *some* allocator to be plugged in. Two settings make it available:
+
+```toml
+# .cargo/config.toml
+build-std = ["core", "compiler_builtins", "alloc"]   # also compile alloc for our target
+```
+
+```rust
+// in lib.rs, main.rs and tests/heap_allocation.rs
+extern crate alloc;
+```
+
+`alloc` isn't linked automatically in a `no_std` crate, so each crate that uses it has to declare it with `extern crate`.
+
+### Plugging in an allocator: `GlobalAlloc`
+
+Every `Box::new`, `Vec::push` and so on eventually calls the **global allocator**: a single `static` that implements the `GlobalAlloc` trait and is marked `#[global_allocator]`. There must be exactly one in the whole program. It's defined in the library, so the kernel binary and every test kernel all use it.
+
+```rust
+pub unsafe trait GlobalAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8;
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout);
+}
+```
+
+`Layout` describes the request: how many bytes, and what alignment the address must have. `alloc` returns a pointer to suitable memory, or null if it can't. The trait is `unsafe` to implement because the implementer promises never to hand out memory that's already in use.
+
+`allocator.rs` still contains `Dummy`, the post's first allocator. It always returns null. If it were the global allocator, the first `Box::new` would get null back, and Rust would report an allocation failure and panic. It is no longer used; `ALLOCATOR` replaced it.
+
+### Creating the heap region: `init_heap`
+
+An allocator needs memory to hand out. The heap is a fixed **virtual** address range that the kernel chooses and then maps to free physical frames:
+
+```rust
+pub const HEAP_START: usize = 0x_4444_4444_0000;   // any unused address; this one is easy to spot
+pub const HEAP_SIZE: usize = 100 * 1024;           // 100 KiB = 25 pages
+```
+
+`init_heap` brings that range to life using the paging code from sections 15 and 16:
+
+```
+ for each of the 25 pages from HEAP_START to HEAP_START + HEAP_SIZE - 1:
+     frame = frame_allocator.allocate_frame()        a free physical frame
+     mapper.map_to(page, frame, PRESENT | WRITABLE)  point the page at it
+         └─ may also call frame_allocator for new page tables
+     .flush()                                         clear the stale TLB entry
+
+ ALLOCATOR.lock().init(HEAP_START, HEAP_SIZE)         hand the region to the allocator
+```
+
+This is the first time `BootInfoFrameAllocator` does real work. Nothing near `0x4444_4444_0000` was mapped before, so the first `map_to` needs new level 3, level 2 and level 1 tables. All 25 pages fit within that one level 1 table, so the heap uses 28 physical frames in total: 25 for the heap and 3 for the tables.
+
+Errors don't panic inside `init_heap`. They come back as `MapToError`, and `?` passes them to the caller, `kernel_main`, which decides what to do (`.expect("heap initialization failed")`).
+
+Order matters: the pages must be mapped **before** `ALLOCATOR.init`. The allocator immediately writes its bookkeeping into the heap memory, and writing to an unmapped page would page fault.
+
+### The allocator: `linked_list_allocator`
+
+```rust
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+```
+
+`LockedHeap` comes from the `linked_list_allocator` crate. It keeps a **free list**: a linked list of the unused blocks of the heap. The trick is that the list nodes are stored **inside the free blocks themselves**. Each free block starts with its own size and a pointer to the next free block, so the allocator needs no memory beyond the heap.
+
+```
+ heap: ┌──────┬───────────┬──────┬────────────────────────┐
+       │ used │ free      │ used │ free                   │
+       └──────┴───────────┴──────┴────────────────────────┘
+                 │ size,next ───────► │ size,next ─► null
+   head ─────────┘
+```
+
+- **`alloc`** walks the list to the first free block that's big enough and correctly aligned, splits off what it needs, and returns it (*first fit*).
+- **`dealloc`** puts the block back in the list and merges it with any free neighbors, so the heap doesn't break up into ever-smaller pieces.
+
+Each block must be large enough to hold a list node, so even a 4-byte `Box<i32>` uses 16 bytes of heap.
+
+`LockedHeap::empty()` is a `const fn`, so `ALLOCATOR` needs no `lazy_static`. It manages nothing until `init` is called. Any allocation before `init_heap` runs fails, and the kernel panics.
+
+**Interrupt safety:** `LockedHeap` is protected by a spinlock, just like `WRITER` (section 11). If an interrupt handler ever allocates, for example by building a `String` or pushing to a `Vec`, while the main code holds the heap lock, the kernel deadlocks. Today's handlers don't allocate, because `print!` formats straight into the VGA buffer without going through the heap.
+
+### What `kernel_main` demonstrates
+
+```
+heap_value at 0x444444440000
+vec at Pointer { addr: 0x444444440800, metadata: 500 }
+current reference count is 2
+reference count is now 1
+```
+
+- **`Box::new(41)`**: one small allocation. It lands at the very start of the heap, `HEAP_START`.
+- **`Vec` with 500 pushes:** a `Vec` grows by allocating a larger buffer, copying the elements across, and freeing the old one. That happens several times here, so this exercises both `alloc` and `dealloc`. The final buffer is somewhere inside the heap.
+- **`Rc`:** a reference-counted pointer. The count lives on the heap next to the value. `clone()` adds one; `drop` takes one away. When the count reaches 0, the value and its count are freed together.
+
+`{:p}` prints the address of `vec.as_slice()`, which is a *fat* pointer: an address plus a length. Recent Rust nightlies print the length as `metadata`, which is why the output differs from the post. `vec.as_ptr()` would print only the address.
+
+### Tests: `tests/heap_allocation.rs`
+
+The heap isn't set up by `rc_os::init()`, so this integration test sets it up itself. It uses `entry_point!` to get `BootInfo`, then calls `memory::init`, `BootInfoFrameAllocator::init` and `init_heap` before running its tests.
+
+| Test | What it proves |
+|---|---|
+| `simple_allocation` | Two `Box`es get separate memory and keep their values. |
+| `large_vec` | A `Vec` can grow to 1000 elements (repeated grow-copy-free) without corrupting data. |
+| `many_boxes` | Freed memory is **reused**. It creates and drops 102,400 boxes one after another, about 1.6 MB in total at 16 bytes each, from a 100 KiB heap. That only succeeds if each `dealloc` returns its block to the free list. |
+
+The library's own unit tests (`cargo test --lib`) do **not** set up a heap. A `#[test_case]` in `src/` that allocates would panic with an allocation failure. Tests that need the heap belong in `tests/heap_allocation.rs`, or in a test kernel that calls `init_heap` first.
+
+---
+
+## 18. File map
 
 | File | Role |
 |---|---|
@@ -1002,13 +1134,15 @@ The VGA buffer can now be reached through two virtual addresses: `0xb8000`, whic
 | `src/vga_buffer.rs` | VGA text-mode writer, `print!` and `println!` (interrupt-safe). |
 | `src/serial.rs` | UART serial output, `serial_print!` and `serial_println!` (interrupt-safe). |
 | `src/interrupts.rs` | IDT, exception handlers (breakpoint, page fault, double fault), PIC setup, timer and keyboard handlers. |
+| `src/allocator.rs` | Global allocator (`LockedHeap`), heap address and size, `init_heap`, unused `Dummy` allocator. |
 | `src/memory.rs` | Page table access (`init`, `OffsetPageTable`), manual `translate_addr`, example mapping, `EmptyFrameAllocator`, `BootInfoFrameAllocator`. |
 | `src/gdt.rs` | GDT, TSS, double-fault IST stack. |
 | `tests/basic_boot.rs` | Integration test: printing works at boot. |
 | `tests/should_panic.rs` | Integration test: panics are reported. |
 | `tests/stack_overflow.rs` | Integration test: stack overflow → handled double fault. |
+| `tests/heap_allocation.rs` | Integration test: heap allocations, `Vec` growth, memory reuse. |
 | `x86_64-rc_os.json` | Custom compilation target (bare metal, no red zone, no SIMD). |
-| `.cargo/config.toml` | Default target, `build-std`, `bootimage` runner. |
+| `.cargo/config.toml` | Default target, `build-std` (`core`, `compiler_builtins`, `alloc`), `bootimage` runner. |
 | `Cargo.toml` | Dependencies, `panic = "abort"`, QEMU test arguments. |
 
 ### Dependencies
@@ -1019,6 +1153,7 @@ The VGA buffer can now be reached through two virtual addresses: `0xb8000`, whic
 | `x86_64` | Safe wrappers for IDT, GDT, TSS, page tables (`OffsetPageTable`, `Mapper`, `FrameAllocator`), control registers (`CR2`, `CR3`), port I/O, and CPU instructions (`int3`, `sti`, `lidt`, `invlpg`...). |
 | `pic8259` | `ChainedPics`: initializing and sending EOIs to the two 8259 PICs. |
 | `pc-keyboard` | Decodes PS/2 scancodes (set 1, US layout) into key events and characters. |
+| `linked_list_allocator` 0.9 | `LockedHeap`: a free-list heap allocator used as the global allocator. |
 | `uart_16550` | Serial port driver. |
 | `spin` | Spinlock `Mutex` for `no_std`. |
 | `lazy_static` | Statics that are initialized at runtime. |
@@ -1026,7 +1161,7 @@ The VGA buffer can now be reached through two virtual addresses: `0xb8000`, whic
 
 ---
 
-## 18. Running it
+## 19. Running it
 
 Requirements: a nightly Rust toolchain with `rust-src`, `llvm-tools-preview`, `bootimage` (`cargo install bootimage`), and QEMU.
 
@@ -1034,6 +1169,7 @@ Requirements: a nightly Rust toolchain with `rust-src`, `llvm-tools-preview`, `b
 cargo run          # build the disk image and boot it in QEMU; click the window and type
 cargo test         # run unit + integration tests headless; results print to your terminal
 cargo test --test stack_overflow   # run a single integration test
+cargo test --test heap_allocation  # run the heap tests
 ```
 
 To debug a triple-fault reboot loop, add `-no-reboot` to the QEMU arguments (bootimage already passes it during `cargo test`). Adding `-d int` shows every interrupt and exception QEMU delivers.

@@ -6,14 +6,18 @@
 #![test_runner(rc_os::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 use bootloader::{BootInfo, entry_point};
+use alloc::{boxed::Box, vec, vec::Vec, rc::Rc};
 use rc_os::println;
 
 entry_point!(kernel_main);
 
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     use rc_os::memory::{self, BootInfoFrameAllocator};
+    use rc_os::allocator;
     use x86_64::{structures::paging::Page, VirtAddr};
 
     println!("Hello World{}", "!");
@@ -30,6 +34,23 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     let vga_address = page.start_address() + 400 * size_of::<u64>() as u64;
     let vga_ptr = vga_address.as_mut_ptr::<u64>();
     unsafe { vga_ptr.write_volatile(0xf021_f877_f065_f04e) };
+
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+
+    let heap_value = Box::new(41);
+    println!("heap_value at {:p}", heap_value);
+
+    let mut vec = Vec::new();
+    for i in 0..500 {
+        vec.push(i);
+    }
+    println!("vec at {:p}", vec.as_slice());
+
+    let reference_counted = Rc::new(vec![1,2,3]);
+    let cloned_reference = reference_counted.clone();
+    println!("current reference count is {}", Rc::strong_count(&cloned_reference));
+    core::mem::drop(reference_counted);
+    println!("reference count is now {}", Rc::strong_count(&cloned_reference));
 
     #[cfg(test)]
     test_main();
