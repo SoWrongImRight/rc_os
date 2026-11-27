@@ -2,7 +2,7 @@
 
 rc_os is a small x86_64 kernel written in Rust. It follows Philipp Oppermann's [Writing an OS in Rust](https://os.phil-opp.com/) series. That series explains how to **build** each piece. This document explains how the pieces **work** once they are built: what the hardware does, what each file is responsible for, and how control moves from power-on to text appearing as you type.
 
-Current stage: **Heap Allocation** (using `linked_list_allocator`). The kernel boots, prints text, handles CPU exceptions and page faults, survives stack overflows, handles timer and keyboard interrupts, manages its own page tables, allocates physical frames from the bootloader's memory map, and has a 100 KiB heap, so `Box`, `Vec` and `Rc` work.
+Current stage: **Allocator Designs** (complete). The global allocator is the project's own fixed-size block allocator. The kernel boots, prints text, handles CPU exceptions and page faults, survives stack overflows, handles timer and keyboard interrupts, manages its own page tables, allocates physical frames from the bootloader's memory map, and has a 100 KiB heap, so `Box`, `Vec` and `Rc` work.
 
 ---
 
@@ -25,8 +25,9 @@ Current stage: **Heap Allocation** (using `linked_list_allocator`). The kernel b
 15. [Reaching the page tables: `BootInfo` and the physical memory offset](#15-reaching-the-page-tables-bootinfo-and-the-physical-memory-offset)
 16. [Creating a mapping](#16-creating-a-mapping)
 17. [Heap allocation](#17-heap-allocation)
-18. [File map](#18-file-map)
-19. [Running it](#19-running-it)
+18. [Allocator designs](#18-allocator-designs)
+19. [File map](#19-file-map)
+20. [Running it](#20-running-it)
 
 ---
 
@@ -1070,31 +1071,26 @@ Errors don't panic inside `init_heap`. They come back as `MapToError`, and `?` p
 
 Order matters: the pages must be mapped **before** `ALLOCATOR.init`. The allocator immediately writes its bookkeeping into the heap memory, and writing to an unmapped page would page fault.
 
-### The allocator: `linked_list_allocator`
+### The allocator: a free list
 
-```rust
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
-```
-
-`LockedHeap` comes from the `linked_list_allocator` crate. It keeps a **free list**: a linked list of the unused blocks of the heap. The trick is that the list nodes are stored **inside the free blocks themselves**. Each free block starts with its own size and a pointer to the next free block, so the allocator needs no memory beyond the heap.
+The heap's job is to track which parts of it are in use. The classic approach is a **free list**: a linked list of the unused blocks. The trick is that the list nodes are stored **inside the free blocks themselves**. Each free block starts with its own size and a pointer to the next free block, so the allocator needs no memory beyond the heap.
 
 ```
  heap: ┌──────┬───────────┬──────┬────────────────────────┐
        │ used │ free      │ used │ free                   │
        └──────┴───────────┴──────┴────────────────────────┘
-                 │ size,next ───────► │ size,next ─► null
+                 │ size,next ───────► │ size,next ─► None
    head ─────────┘
 ```
 
-- **`alloc`** walks the list to the first free block that's big enough and correctly aligned, splits off what it needs, and returns it (*first fit*).
-- **`dealloc`** puts the block back in the list and merges it with any free neighbors, so the heap doesn't break up into ever-smaller pieces.
+- **`alloc`** walks the list to the first free block that's big enough and correctly aligned, splits off what it needs, and returns the rest to the list (*first fit*).
+- **`dealloc`** puts the block back on the list. The `linked_list_allocator` crate also merges it with any free neighbours, so the heap doesn't break up into ever-smaller pieces.
 
-Each block must be large enough to hold a list node, so even a 4-byte `Box<i32>` uses 16 bytes of heap.
+The project first used the `linked_list_allocator` crate's `LockedHeap` as the global allocator. It has since been replaced by allocators written in this project (section 18). The crate is still used inside the new allocator, for large allocations.
 
-`LockedHeap::empty()` is a `const fn`, so `ALLOCATOR` needs no `lazy_static`. It manages nothing until `init` is called. Any allocation before `init_heap` runs fails, and the kernel panics.
+Whatever allocator is plugged in, it manages nothing until `init_heap` hands it the heap region. Any allocation before then fails, and the kernel panics.
 
-**Interrupt safety:** `LockedHeap` is protected by a spinlock, just like `WRITER` (section 11). If an interrupt handler ever allocates, for example by building a `String` or pushing to a `Vec`, while the main code holds the heap lock, the kernel deadlocks. Today's handlers don't allocate, because `print!` formats straight into the VGA buffer without going through the heap.
+**Interrupt safety:** the global allocator is protected by a spinlock, just like `WRITER` (section 11). If an interrupt handler ever allocates, for example by building a `String` or pushing to a `Vec`, while the main code holds the heap lock, the kernel deadlocks. Today's handlers don't allocate, because `print!` formats straight into the VGA buffer without going through the heap.
 
 ### What `kernel_main` demonstrates
 
@@ -1105,7 +1101,7 @@ current reference count is 2
 reference count is now 1
 ```
 
-- **`Box::new(41)`**: one small allocation. It lands at the very start of the heap, `HEAP_START`.
+- **`Box::new(41)`**: one small allocation. It lands at the very start of the heap, `HEAP_START`. Section 18 explains exactly where each allocation lands.
 - **`Vec` with 500 pushes:** a `Vec` grows by allocating a larger buffer, copying the elements across, and freeing the old one. That happens several times here, so this exercises both `alloc` and `dealloc`. The final buffer is somewhere inside the heap.
 - **`Rc`:** a reference-counted pointer. The count lives on the heap next to the value. `clone()` adds one; `drop` takes one away. When the count reaches 0, the value and its count are freed together.
 
@@ -1119,13 +1115,159 @@ The heap isn't set up by `rc_os::init()`, so this integration test sets it up it
 |---|---|
 | `simple_allocation` | Two `Box`es get separate memory and keep their values. |
 | `large_vec` | A `Vec` can grow to 1000 elements (repeated grow-copy-free) without corrupting data. |
-| `many_boxes` | Freed memory is **reused**. It creates and drops 102,400 boxes one after another, about 1.6 MB in total at 16 bytes each, from a 100 KiB heap. That only succeeds if each `dealloc` returns its block to the free list. |
+| `many_boxes` | Freed memory is **reused**. It creates and drops 102,400 boxes one after another, about 0.8–1.6 MB in total depending on the allocator's minimum block size, from a 100 KiB heap. That only succeeds if each `dealloc` makes its block available again. |
+| `many_boxes_long_lived` | Same, but with one `Box` kept alive throughout. Added with the allocator designs; see section 18. |
 
 The library's own unit tests (`cargo test --lib`) do **not** set up a heap. A `#[test_case]` in `src/` that allocates would panic with an allocation failure. Tests that need the heap belong in `tests/heap_allocation.rs`, or in a test kernel that calls `init_heap` first.
 
 ---
 
-## 18. File map
+## 18. Allocator designs
+
+**Files:** `src/allocator.rs`, `src/allocator/linked_list.rs`, `src/allocator/fixed_size_block.rs`. This matches the [Allocator Designs](https://os.phil-opp.com/allocator-designs/) post.
+
+Section 17 plugged in a ready-made allocator. This section replaces it with allocators written in this project, to show how they work inside. There are two designs, and the second one is the global allocator.
+
+### Shared helpers (`allocator.rs`)
+
+**`Locked<A>`: a wrapper so we're allowed to implement the trait.** `GlobalAlloc::alloc` takes `&self`, a *shared* reference, but every allocator has to change its own bookkeeping. The usual answer is a `spin::Mutex`. However, Rust's **orphan rule** only allows implementing a trait for a type when either the trait or the type is defined in this crate. Both `GlobalAlloc` and `spin::Mutex` come from other crates, so `impl GlobalAlloc for spin::Mutex<MyAllocator>` is rejected. `Locked<A>` is a one-field struct defined here, so this is allowed:
+
+```rust
+pub struct Locked<A> { inner: spin::Mutex<A> }
+
+unsafe impl GlobalAlloc for Locked<FixedSizeBlockAllocator> { ... }
+```
+
+`Locked::new` is a `const fn`, so the global `static` needs no `lazy_static`.
+
+**`align_up`: rounding an address up to a multiple of `align`.**
+
+```rust
+fn align_up(addr: usize, align: usize) -> usize {
+    (addr + align - 1) & !(align - 1)
+}
+```
+
+Alignments are always powers of two, so `align - 1` is a mask of the low bits. For example, 16 − 1 = `0b1111`. Adding `align - 1` pushes any address that isn't already aligned past the next boundary, and `& !(align - 1)` clears the low bits to land exactly on it. For example, `align_up(0x1003, 16)`: `0x1003 + 0xF = 0x1012`, then clearing the low 4 bits gives `0x1010`. An address that's already aligned stays the same.
+
+The post also builds a *bump allocator*, which only moves a pointer forward and can only reuse memory once **every** allocation has been freed. This project doesn't include it, but the `many_boxes_long_lived` test (below) shows exactly the case where it fails.
+
+### Design 1: our own linked-list allocator (`linked_list.rs`)
+
+This is a hand-written version of the free-list idea from section 17. It's no longer the global allocator, but it's kept as a working example.
+
+Each free region of the heap starts with a `ListNode` written **into the free memory itself**:
+
+```rust
+struct ListNode {
+    size: usize,                         // size of this free region
+    next: Option<&'static mut ListNode>, // next free region
+}
+```
+
+The allocator only stores a dummy `head` node. Everything else lives in the heap.
+
+- **`add_free_region(addr, size)`** writes a new node at `addr` and pushes it onto the front of the list. It asserts the region is aligned for, and big enough to hold, a `ListNode`. Otherwise there would be nowhere to put the bookkeeping.
+- **`alloc`**:
+  1. `size_align` rounds the request up so every block is at least `ListNode`-sized and -aligned. That way it can hold a node again when it's freed.
+  2. `find_region` walks the list and asks `alloc_from_region` whether each region fits. A region fits if, after aligning the start, the allocation ends inside the region, and the leftover is either zero or large enough to hold a `ListNode`. A leftover that's too small could never be tracked, so it would be lost.
+  3. The matching region is unlinked from the list (`current.next = region.next.take()`).
+  4. If there's leftover space after the allocation, it goes back on the list with `add_free_region`.
+- **`dealloc`** just calls `add_free_region` on the block.
+
+```
+ before alloc(24):   head ─► [free 64] ─► [free 200] ─► None
+ after:              head ─► [free 40] ─► [free 200] ─► None
+                             (leftover)        returned: the first 24 bytes
+```
+
+**Limitations, compared with the `linked_list_allocator` crate:**
+
+- **No merging.** Freed blocks are never combined with their free neighbours. Over time the heap breaks into many small regions (*fragmentation*), and a large request can fail even when there's plenty of free memory in total.
+- **Slow.** Every allocation walks the list from the start, so the cost grows with the number of free regions.
+
+### Design 2: the fixed-size block allocator (`fixed_size_block.rs`), the global allocator
+
+```rust
+#[global_allocator]
+static ALLOCATOR: Locked<FixedSizeBlockAllocator> = Locked::new(FixedSizeBlockAllocator::new());
+```
+
+**Idea:** most allocations are small. Instead of searching for a region that fits exactly, round every request up to one of a few **block sizes** and keep a separate free list for each size.
+
+```rust
+const BLOCK_SIZES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+
+pub struct FixedSizeBlockAllocator {
+    list_heads: [Option<&'static mut ListNode>; BLOCK_SIZES.len()], // one free list per size
+    fallback_allocator: linked_list_allocator::Heap,                // for everything else
+}
+```
+
+The nodes here only need a `next` pointer and no `size`, because the block size is implied by which list a block is in.
+
+```
+ list_heads[0]  (8 B)    ─► [8] ─► [8] ─► None
+ list_heads[1]  (16 B)   ─► [16] ─► None
+ list_heads[2]  (32 B)   ─► None
+ ...
+ list_heads[8]  (2048 B) ─► [2048] ─► None
+ anything bigger than 2048 B (or more strictly aligned) ─► fallback_allocator
+```
+
+**Choosing a list:** `list_index` picks the smallest block size that is at least `max(size, align)`. Because every block size is a power of two, and blocks of size *N* are always placed at addresses aligned to *N*, a block that's big enough is also aligned enough. A request larger than 2048 bytes gets `None` and goes straight to the fallback.
+
+**`alloc`:**
+
+```
+ list_index(layout)
+   ├─ Some(i), list i has a block ─► pop it: list_heads[i] = node.next.take()   O(1), no searching
+   ├─ Some(i), list i is empty    ─► fallback_alloc(BLOCK_SIZES[i] bytes, aligned to BLOCK_SIZES[i])
+   └─ None (too big)              ─► fallback_alloc(layout as requested)
+```
+
+**`dealloc`:**
+
+```
+ list_index(layout)
+   ├─ Some(i) ─► write a ListNode into the block and push it onto list i     O(1)
+   └─ None    ─► fallback_allocator.deallocate(ptr, layout)
+```
+
+`dealloc` gets the same `Layout` that was passed to `alloc` (Rust requires this), so `list_index` always picks the same list on the way back. The two `assert!`s check that a block can hold a `ListNode`: `size_of::<ListNode>()` (8 bytes) must be `<=` the block size, and likewise for alignment. Every size in `BLOCK_SIZES` is at least 8, so they always pass.
+
+**`init`** hands the whole heap to the fallback allocator. The block lists start empty and fill up as memory is freed. Blocks are carved out of the fallback heap only on demand.
+
+**Trade-offs:**
+
+| | Fixed-size block |
+|---|---|
+| Speed | Allocating or freeing a block ≤ 2048 bytes is a single list push or pop, with no searching. This is the main win. |
+| Wasted space | A request is rounded up to the next block size. A 9-byte request uses a 16-byte block, and a 1025-byte one uses 2048 bytes. |
+| Memory stays in its size class | A freed 16-byte block can only ever be reused for another 16-byte-class request. It's never returned to the fallback or merged. If a program frees many small blocks and then wants one large one, that memory can't help. |
+| Fallback | Large allocations still pay the linked-list search cost, but they are rare. |
+
+### Why the demo's `Vec` is at `0x…0800`
+
+The fixed-size block allocator makes the addresses in the `kernel_main` output easy to explain:
+
+- `Box::new(41)` asks for 4 bytes. The 8-byte list is empty, so the fallback gives an 8-byte block at the start of the heap: **`0x4444_4444_0000`**.
+- The `Vec` of `i32` starts with room for 4 elements (16 bytes), then doubles each time it fills: 32, 64, 128, ..., up to **2048** bytes for 512 elements. Each new buffer comes from a new size class whose list is empty, so the fallback allocates it **aligned to its own size**: 16 bytes at `0x…0010`, 32 at `0x…0020`, ..., 1024 at `0x…0400`. The old buffer is freed onto its size-class list.
+- The final 2048-byte buffer must be 2048-aligned, and `0x…0800` is the first free address that is. That's **`0x4444_4444_0800`**.
+
+### Tests
+
+`tests/heap_allocation.rs` runs unchanged against the new allocator, plus one new test:
+
+| Test | What it proves |
+|---|---|
+| `many_boxes_long_lived` | Freed memory is reused **while another allocation stays alive**. It holds one `Box` for the whole test while creating and dropping 102,400 others. A bump allocator fails this test, because one live allocation stops it from ever resetting. Both allocators in this project pass, because each freed block goes back onto a free list straight away. |
+
+**Interrupt safety** is unchanged from section 17. `Locked` is a spinlock, so interrupt handlers must not allocate.
+
+---
+
+## 19. File map
 
 | File | Role |
 |---|---|
@@ -1134,13 +1276,15 @@ The library's own unit tests (`cargo test --lib`) do **not** set up a heap. A `#
 | `src/vga_buffer.rs` | VGA text-mode writer, `print!` and `println!` (interrupt-safe). |
 | `src/serial.rs` | UART serial output, `serial_print!` and `serial_println!` (interrupt-safe). |
 | `src/interrupts.rs` | IDT, exception handlers (breakpoint, page fault, double fault), PIC setup, timer and keyboard handlers. |
-| `src/allocator.rs` | Global allocator (`LockedHeap`), heap address and size, `init_heap`, unused `Dummy` allocator. |
+| `src/allocator.rs` | Global allocator (`Locked<FixedSizeBlockAllocator>`), `Locked` wrapper, `align_up`, heap address and size, `init_heap`, unused `Dummy` allocator. |
+| `src/allocator/linked_list.rs` | Hand-written linked-list allocator (example, not the global allocator). |
+| `src/allocator/fixed_size_block.rs` | Fixed-size block allocator with a `linked_list_allocator::Heap` fallback. This is the global allocator. |
 | `src/memory.rs` | Page table access (`init`, `OffsetPageTable`), manual `translate_addr`, example mapping, `EmptyFrameAllocator`, `BootInfoFrameAllocator`. |
 | `src/gdt.rs` | GDT, TSS, double-fault IST stack. |
 | `tests/basic_boot.rs` | Integration test: printing works at boot. |
 | `tests/should_panic.rs` | Integration test: panics are reported. |
 | `tests/stack_overflow.rs` | Integration test: stack overflow → handled double fault. |
-| `tests/heap_allocation.rs` | Integration test: heap allocations, `Vec` growth, memory reuse. |
+| `tests/heap_allocation.rs` | Integration test: heap allocations, `Vec` growth, memory reuse (including with a long-lived allocation). |
 | `x86_64-rc_os.json` | Custom compilation target (bare metal, no red zone, no SIMD). |
 | `.cargo/config.toml` | Default target, `build-std` (`core`, `compiler_builtins`, `alloc`), `bootimage` runner. |
 | `Cargo.toml` | Dependencies, `panic = "abort"`, QEMU test arguments. |
@@ -1153,7 +1297,7 @@ The library's own unit tests (`cargo test --lib`) do **not** set up a heap. A `#
 | `x86_64` | Safe wrappers for IDT, GDT, TSS, page tables (`OffsetPageTable`, `Mapper`, `FrameAllocator`), control registers (`CR2`, `CR3`), port I/O, and CPU instructions (`int3`, `sti`, `lidt`, `invlpg`...). |
 | `pic8259` | `ChainedPics`: initializing and sending EOIs to the two 8259 PICs. |
 | `pc-keyboard` | Decodes PS/2 scancodes (set 1, US layout) into key events and characters. |
-| `linked_list_allocator` 0.9 | `LockedHeap`: a free-list heap allocator used as the global allocator. |
+| `linked_list_allocator` 0.9 | `Heap`: the fallback allocator inside `FixedSizeBlockAllocator`, for requests larger than 2048 bytes. |
 | `uart_16550` | Serial port driver. |
 | `spin` | Spinlock `Mutex` for `no_std`. |
 | `lazy_static` | Statics that are initialized at runtime. |
@@ -1161,7 +1305,7 @@ The library's own unit tests (`cargo test --lib`) do **not** set up a heap. A `#
 
 ---
 
-## 19. Running it
+## 20. Running it
 
 Requirements: a nightly Rust toolchain with `rust-src`, `llvm-tools-preview`, `bootimage` (`cargo install bootimage`), and QEMU.
 
